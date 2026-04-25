@@ -1,0 +1,67 @@
+package domain
+
+import "time"
+
+type TaskStatus string
+
+const (
+	StatusCreated       TaskStatus = "created"
+	StatusPlanning      TaskStatus = "planning"
+	StatusExecuting     TaskStatus = "executing"
+	StatusWaitingAction TaskStatus = "waiting_action"
+	StatusCompleted     TaskStatus = "completed"
+	StatusFailed        TaskStatus = "failed"
+)
+
+type StepStatus string
+
+const (
+	StepPending   StepStatus = "pending"
+	StepRunning   StepStatus = "running"
+	StepCompleted StepStatus = "completed"
+	StepFailed    StepStatus = "failed"
+)
+
+type Task struct {
+	TaskID          string     `json:"taskId"`
+	Title           string     `json:"title"`
+	UserInstruction string     `json:"userInstruction"`
+	Source          string     `json:"source"`
+	Status          TaskStatus `json:"status"`
+	CurrentStep     string     `json:"currentStep"`
+	ProgressText    string     `json:"progressText"`
+	DocURL          string     `json:"docUrl,omitempty"`
+	SlidesURL       string     `json:"slidesUrl,omitempty"`
+	Summary         string     `json:"summary,omitempty"`
+	RequiresAction  bool       `json:"requiresAction"`
+	ErrorMessage    string     `json:"errorMessage,omitempty"`
+	Version         int        `json:"version"`
+	LastActor       string     `json:"lastActor"`
+	CreatedAt       time.Time  `json:"createdAt"`
+	UpdatedAt       time.Time  `json:"updatedAt"`
+	Steps           []Step     `json:"steps"`
+}
+
+type Step struct {
+	ID             string     `json:"id"`
+	Name           string     `json:"name"`
+	Status         StepStatus `json:"status"`
+	PayloadSummary string     `json:"payloadSummary"`
+	ErrorMessage   string     `json:"errorMessage,omitempty"`
+	StartedAt      *time.Time `json:"startedAt,omitempty"`
+	CompletedAt    *time.Time `json:"completedAt,omitempty"`
+}
+
+type Plan struct {
+	Summary  string
+	Steps    []string
+	DocTitle string
+}
+
+type ActionType string
+
+const (
+	ActionRetryTask       ActionType = "retry_task"
+	ActionApproveContinue ActionType = "approve_continue"
+	ActionOpenArtifact    ActionType = "open_artifact"
+)

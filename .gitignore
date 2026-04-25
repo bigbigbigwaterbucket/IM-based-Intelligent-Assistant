@@ -1,0 +1,48 @@
+node_modules/
+dist/
+build/
+.turbo/
+.vite/
+coverage/
+*.log
+.env
+.env.local
+tmp/
+bin/
+backend/agentpilot.db
+backend/.cache/
+backend/.modcache/
+
+
+# local env files
+
+.env.local
+.env.*.local
+
+# Log files
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor directories and files
+
+.idea
+.vscode
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+*.iml
+
+
+# binary files
+
+*.exe
+
+# SQLite database files
+
+*.db
+*.sqlite
+*.sqlite3

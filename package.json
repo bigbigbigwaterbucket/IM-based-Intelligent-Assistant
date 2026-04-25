@@ -1,0 +1,15 @@
+{
+  "name": "agent-pilot-mvp",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:desktop": "npm run dev -w @agent-pilot/desktop",
+    "dev:mobile": "npm run dev -w @agent-pilot/mobile",
+    "build:desktop": "npm run build -w @agent-pilot/desktop",
+    "build:mobile": "npm run build -w @agent-pilot/mobile",
+    "typecheck": "npm run typecheck --workspaces"
+  }
+}

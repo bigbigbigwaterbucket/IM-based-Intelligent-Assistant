@@ -1,0 +1,67 @@
+body {
+  margin: 0;
+  font-family: "Segoe UI", "PingFang SC", sans-serif;
+  background: #f7f6f2;
+  color: #16231f;
+}
+
+.mobile-shell {
+  padding: 16px;
+}
+
+header {
+  padding-bottom: 12px;
+}
+
+.mobile-list {
+  display: grid;
+  gap: 10px;
+}
+
+.mobile-card,
+.mobile-detail,
+.mobile-actions button {
+  font: inherit;
+}
+
+.mobile-card,
+.mobile-detail {
+  background: white;
+  border: 1px solid rgba(22, 35, 31, 0.08);
+  border-radius: 18px;
+  padding: 14px;
+  box-shadow: 0 14px 40px rgba(22, 35, 31, 0.08);
+}
+
+.mobile-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  text-align: left;
+}
+
+.mobile-detail {
+  margin-top: 16px;
+}
+
+.mobile-actions {
+  display: flex;
+  gap: 10px;
+  margin: 16px 0;
+}
+
+.mobile-actions button {
+  border: 0;
+  border-radius: 999px;
+  background: #1f7a5d;
+  color: white;
+  padding: 10px 16px;
+}
+
+a {
+  display: block;
+  margin-bottom: 8px;
+  color: #1f7a5d;
+  word-break: break-all;
+}
+
