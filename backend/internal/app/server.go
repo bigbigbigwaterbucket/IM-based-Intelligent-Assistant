@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,8 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"agentpilot/backend/internal/config"
+	"agentpilot/backend/internal/larkbot"
 	"agentpilot/backend/internal/orchestrator"
 	"agentpilot/backend/internal/planner"
 	"agentpilot/backend/internal/statehub"
@@ -18,11 +21,16 @@ import (
 )
 
 type Server struct {
-	addr    string
-	handler http.Handler
+	addr     string
+	handler  http.Handler
+	shutdown func()
 }
 
 func NewServer() (*Server, error) {
+	if err := config.LoadDotEnv(os.Getenv("ENV_FILE"), "backend/.env", ".env"); err != nil {
+		return nil, fmt.Errorf("load env file: %w", err)
+	}
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -48,15 +56,30 @@ func NewServer() (*Server, error) {
 	toolRunner := tools.NewRunner(tools.Config{
 		LarkCLIPath:     envOrDefault("LARK_CLI_PATH", "lark-cli"),
 		EnableLarkTools: strings.EqualFold(os.Getenv("ENABLE_LARK_TOOLS"), "true"),
+		ArtifactDir:     envOrDefault("ARTIFACT_DIR", tools.ArtifactDir()),
 	})
 	orch := orchestrator.New(taskStore, hub, planSvc, toolRunner)
+
+	shutdown := func() {}
+	botConfig := larkbot.ConfigFromEnv()
+	if botConfig.Enabled {
+		botCtx, botCancel := context.WithCancel(context.Background())
+		bot, err := larkbot.New(botConfig, orch)
+		if err != nil {
+			botCancel()
+			return nil, fmt.Errorf("create feishu bot: %w", err)
+		}
+		bot.Start(botCtx)
+		shutdown = botCancel
+	}
 
 	mux := http.NewServeMux()
 	registerRoutes(mux, orch, hub, taskStore)
 
 	return &Server{
-		addr:    ":" + port,
-		handler: withCORS(mux),
+		addr:     ":" + port,
+		handler:  withCORS(mux),
+		shutdown: shutdown,
 	}, nil
 }
 
@@ -66,6 +89,12 @@ func (s *Server) Addr() string {
 
 func (s *Server) Handler() http.Handler {
 	return s.handler
+}
+
+func (s *Server) Close() {
+	if s.shutdown != nil {
+		s.shutdown()
+	}
 }
 
 func registerRoutes(mux *http.ServeMux, orch *orchestrator.Service, hub *statehub.Hub, taskStore store.TaskRepository) {
@@ -151,6 +180,7 @@ func registerRoutes(mux *http.ServeMux, orch *orchestrator.Service, hub *statehu
 	})
 
 	mux.Handle("/ws", hub.Handler())
+	mux.Handle("/artifacts/", http.StripPrefix("/artifacts/", http.FileServer(http.Dir(envOrDefault("ARTIFACT_DIR", tools.ArtifactDir())))))
 }
 
 func withCORS(next http.Handler) http.Handler {

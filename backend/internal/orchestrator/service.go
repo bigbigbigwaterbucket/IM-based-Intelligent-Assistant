@@ -126,6 +126,40 @@ func (s *Service) SubmitAction(ctx context.Context, taskID string, input ActionI
 	}
 }
 
+func (s *Service) GetTask(ctx context.Context, taskID string) (domain.Task, error) {
+	return s.store.Get(ctx, taskID)
+}
+
+func (s *Service) WaitTaskDone(ctx context.Context, taskID string, timeout, interval time.Duration) (domain.Task, error) {
+	if timeout <= 0 {
+		timeout = 180 * time.Second
+	}
+	if interval <= 0 {
+		interval = 3 * time.Second
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	for {
+		task, err := s.store.Get(ctx, taskID)
+		if err != nil {
+			return domain.Task{}, err
+		}
+		if task.Status == domain.StatusCompleted || task.Status == domain.StatusFailed {
+			return task, nil
+		}
+
+		timer := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return domain.Task{}, fmt.Errorf("wait task done: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
 func (s *Service) runTask(ctx context.Context, taskID string) {
 	task, err := s.store.Get(ctx, taskID)
 	if err != nil {
@@ -137,7 +171,7 @@ func (s *Service) runTask(ctx context.Context, taskID string) {
 		current.CurrentStep = "planning"
 		current.ProgressText = "Agent 正在规划任务"
 		current.LastActor = "agent"
-		current.Steps = append(current.Steps, newStep("planning", "需求规划", domain.StepRunning, "生成文档与演示稿计划"))
+		current.Steps = append(current.Steps, newStep("intent_analysis", "意图分析与任务规划", domain.StepRunning, "识别受众、交付物、上下文需求和风险"))
 	})
 	if task.TaskID == "" {
 		return
@@ -153,12 +187,12 @@ func (s *Service) runTask(ctx context.Context, taskID string) {
 		completeLatestStep(current)
 		current.Summary = plan.Summary
 		current.Status = domain.StatusExecuting
-		current.CurrentStep = "create_doc"
-		current.ProgressText = "正在生成方案文档"
-		current.Steps = append(current.Steps, newStep("create_doc", "创建 Doc", domain.StepRunning, plan.DocTitle))
+		current.CurrentStep = "generate_doc"
+		current.ProgressText = fmt.Sprintf("规划完成：%d 个步骤，正在生成方案文档", len(plan.Steps))
+		current.Steps = append(current.Steps, newStep("generate_doc", "生成方案文档", domain.StepRunning, plan.DocTitle))
 	})
 
-	docResult := s.tools.CreateDoc(ctx, plan.DocTitle, task.UserInstruction)
+	docResult := s.tools.CreateDoc(ctx, plan, task.UserInstruction)
 	if !docResult.Success {
 		s.failTask(ctx, taskID, "文档生成失败: "+docResult.ErrorMessage, true)
 		return
@@ -167,13 +201,13 @@ func (s *Service) runTask(ctx context.Context, taskID string) {
 	task = s.updateTask(ctx, task, func(current *domain.Task) {
 		completeLatestStep(current)
 		current.DocURL = docResult.ArtifactURL
-		current.ProgressText = "文档已生成，正在生成演示稿"
-		current.CurrentStep = "create_slides"
-		current.Steps = append(current.Steps, newStep("create_slides", "创建 Slides", domain.StepRunning, "根据文档摘要生成汇报材料"))
+		current.ProgressText = "文档已生成，正在生成演示稿与演讲稿"
+		current.CurrentStep = "generate_slides"
+		current.Steps = append(current.Steps, newStep("generate_slides", "生成演示稿", domain.StepRunning, plan.SlideTitle))
 	})
 	s.hub.Broadcast("artifact.updated", taskID, task.Version, task)
 
-	slidesResult := s.tools.CreateSlides(ctx, task.Title, plan.Summary)
+	slidesResult := s.tools.CreateSlides(ctx, plan)
 	if !slidesResult.Success {
 		s.failTask(ctx, taskID, "演示稿生成失败: "+slidesResult.ErrorMessage, true)
 		return
@@ -182,7 +216,21 @@ func (s *Service) runTask(ctx context.Context, taskID string) {
 	task = s.updateTask(ctx, task, func(current *domain.Task) {
 		completeLatestStep(current)
 		current.SlidesURL = slidesResult.ArtifactURL
-		current.ProgressText = "文档与演示稿均已生成"
+		current.ProgressText = "演示稿已生成，正在汇总产物"
+		current.CurrentStep = "archive_bundle"
+		current.Steps = append(current.Steps, newStep("archive_bundle", "汇总产物", domain.StepRunning, "生成 manifest 并整理交付链接"))
+	})
+	s.hub.Broadcast("artifact.updated", taskID, task.Version, task)
+
+	bundleResult := s.tools.Bundle(ctx, task, plan, docResult, slidesResult)
+	if !bundleResult.Success {
+		s.failTask(ctx, taskID, "产物汇总失败: "+bundleResult.ErrorMessage, true)
+		return
+	}
+
+	task = s.updateTask(ctx, task, func(current *domain.Task) {
+		completeLatestStep(current)
+		current.ProgressText = "文档、演示稿与产物清单均已生成"
 		current.CurrentStep = "completed"
 		current.Status = domain.StatusCompleted
 		current.Summary = plan.Summary

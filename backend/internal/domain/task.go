@@ -53,9 +53,42 @@ type Step struct {
 }
 
 type Plan struct {
-	Summary  string
-	Steps    []string
-	DocTitle string
+	Summary          string
+	PlannerSource    string
+	PlannerError     string
+	Analysis         IntentAnalysis
+	Steps            []PlanStep
+	DocTitle         string
+	SlideTitle       string
+	DocumentSections []DocumentSection
+	Slides           []Slide
+}
+
+type IntentAnalysis struct {
+	Objective      string
+	Audience       string
+	Deliverables   []string
+	ContextNeeded  bool
+	Risks          []string
+	ClarifyingHint string
+}
+
+type PlanStep struct {
+	ID          string
+	Tool        string
+	Description string
+	DependsOn   []string
+}
+
+type DocumentSection struct {
+	Heading string
+	Bullets []string
+}
+
+type Slide struct {
+	Title       string
+	Bullets     []string
+	SpeakerNote string
 }
 
 type ActionType string

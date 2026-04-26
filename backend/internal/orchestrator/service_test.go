@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,7 +34,7 @@ func TestCreateTaskCompletesPipeline(t *testing.T) {
 		taskStore,
 		statehub.NewHub(),
 		planner.NewService(),
-		tools.NewRunner(tools.Config{}),
+		tools.NewRunner(tools.Config{ArtifactDir: t.TempDir()}),
 	)
 
 	task, err := service.CreateTask(context.Background(), CreateTaskInput{
@@ -64,8 +65,119 @@ func TestCreateTaskCompletesPipeline(t *testing.T) {
 	if latest.SlidesURL == "" {
 		t.Fatal("expected slides url to be set")
 	}
+	if latest.DocURL == "https://placeholder.local" || latest.SlidesURL == "https://placeholder.local" {
+		t.Fatal("expected real artifact urls, got placeholder urls")
+	}
+	if !strings.HasPrefix(latest.DocURL, "/artifacts/") {
+		t.Fatalf("expected local doc artifact url, got %s", latest.DocURL)
+	}
+	if !strings.HasPrefix(latest.SlidesURL, "/artifacts/") {
+		t.Fatalf("expected local slides artifact url, got %s", latest.SlidesURL)
+	}
 	if latest.Version < 4 {
 		t.Fatalf("expected version to advance, got %d", latest.Version)
+	}
+}
+
+func TestWaitTaskDoneReturnsCompletedTask(t *testing.T) {
+	t.Parallel()
+
+	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	taskStore, err := store.NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	service := New(
+		taskStore,
+		statehub.NewHub(),
+		planner.NewService(),
+		tools.NewRunner(tools.Config{ArtifactDir: t.TempDir()}),
+	)
+
+	now := time.Now()
+	task := domain.Task{
+		TaskID:          "wait-completed",
+		Title:           "等待完成",
+		UserInstruction: "测试",
+		Source:          "test",
+		Status:          domain.StatusExecuting,
+		CurrentStep:     "executing",
+		ProgressText:    "执行中",
+		Version:         1,
+		LastActor:       "test",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if _, err := taskStore.Create(context.Background(), task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		task.Status = domain.StatusCompleted
+		task.CurrentStep = "completed"
+		task.ProgressText = "完成"
+		task.Version++
+		task.UpdatedAt = time.Now()
+		_, _ = taskStore.Update(context.Background(), task)
+	}()
+
+	done, err := service.WaitTaskDone(context.Background(), task.TaskID, time.Second, 10*time.Millisecond)
+	if err != nil {
+		t.Fatalf("wait task done: %v", err)
+	}
+	if done.Status != domain.StatusCompleted {
+		t.Fatalf("expected completed task, got %s", done.Status)
+	}
+}
+
+func TestWaitTaskDoneTimesOut(t *testing.T) {
+	t.Parallel()
+
+	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	taskStore, err := store.NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	service := New(
+		taskStore,
+		statehub.NewHub(),
+		planner.NewService(),
+		tools.NewRunner(tools.Config{ArtifactDir: t.TempDir()}),
+	)
+
+	now := time.Now()
+	task := domain.Task{
+		TaskID:          "wait-timeout",
+		Title:           "等待超时",
+		UserInstruction: "测试",
+		Source:          "test",
+		Status:          domain.StatusExecuting,
+		CurrentStep:     "executing",
+		ProgressText:    "执行中",
+		Version:         1,
+		LastActor:       "test",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if _, err := taskStore.Create(context.Background(), task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	if _, err := service.WaitTaskDone(context.Background(), task.TaskID, 50*time.Millisecond, 10*time.Millisecond); err == nil {
+		t.Fatal("expected timeout error")
 	}
 }
 
