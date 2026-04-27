@@ -3,15 +3,19 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	lark "github.com/larksuite/oapi-sdk-go/v3"
+	larkdocx "github.com/larksuite/oapi-sdk-go/v3/service/docx/v1"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 
 	"agentpilot/backend/internal/domain"
 )
@@ -19,13 +23,16 @@ import (
 const defaultArtifactDir = "data/pilot_artifacts"
 
 type Config struct {
-	LarkCLIPath     string
-	EnableLarkTools bool
-	ArtifactDir     string
+	FeishuAppID       string
+	FeishuAppSecret   string
+	EnableFeishuTools bool
+	FeishuDocBaseURL  string
+	ArtifactDir       string
 }
 
 type Runner struct {
 	config Config
+	client *lark.Client
 }
 
 type Result struct {
@@ -43,11 +50,85 @@ func NewRunner(config Config) *Runner {
 	if config.ArtifactDir == "" {
 		config.ArtifactDir = defaultArtifactDir
 	}
-	return &Runner{config: config}
+	config.FeishuDocBaseURL = strings.TrimRight(config.FeishuDocBaseURL, "/")
+
+	var client *lark.Client
+	if config.EnableFeishuTools && config.FeishuAppID != "" && config.FeishuAppSecret != "" {
+		client = lark.NewClient(config.FeishuAppID, config.FeishuAppSecret)
+	}
+	return &Runner{config: config, client: client}
 }
 
 func ArtifactDir() string {
 	return defaultArtifactDir
+}
+
+func (r *Runner) FetchThread(ctx context.Context, task domain.Task, step domain.PlanStep) Result {
+	limit := limitFromStep(step, 20)
+	data := map[string]string{
+		"source":     "feishu_im",
+		"limit":      strconv.Itoa(limit),
+		"chat_id":    task.ChatID,
+		"thread_id":  task.ThreadID,
+		"message_id": task.MessageID,
+	}
+
+	if task.ChatID == "" {
+		data["source"] = "missing_chat_id"
+		return Result{
+			Success:        true,
+			StepName:       "im.fetch_thread",
+			PayloadSummary: "当前任务没有飞书 chat_id，跳过 IM 历史读取。",
+			Data:           data,
+		}
+	}
+	if r.client == nil {
+		data["source"] = "feishu_sdk_disabled"
+		return Result{
+			Success:        true,
+			StepName:       "im.fetch_thread",
+			PayloadSummary: "飞书 SDK 工具未启用或缺少应用凭据，已记录 IM 上下文读取需求。",
+			Data:           data,
+		}
+	}
+
+	req := larkim.NewListMessageReqBuilder().
+		ContainerIdType("chat").
+		ContainerId(task.ChatID).
+		SortType(larkim.SortTypeListMessageByCreateTimeDesc).
+		PageSize(limit).
+		Build()
+	resp, err := r.client.Im.V1.Message.List(ctx, req)
+	if err != nil {
+		return failed("im.fetch_thread", err)
+	}
+	if resp == nil {
+		return failed("im.fetch_thread", errors.New("empty Feishu IM response"))
+	}
+	if !resp.Success() {
+		return failed("im.fetch_thread", fmt.Errorf("Feishu IM list failed: code=%d msg=%s", resp.Code, resp.Msg))
+	}
+
+	messages := normalizeMessages(resp.Data, task.ThreadID)
+	if len(messages) > 0 {
+		data["messages"] = strings.Join(messages, "\n")
+	}
+	data["count"] = strconv.Itoa(len(messages))
+	return Result{
+		Success:        true,
+		StepName:       "im.fetch_thread",
+		PayloadSummary: fmt.Sprintf("已读取飞书会话最近 %d 条消息。", len(messages)),
+		Data:           data,
+	}
+}
+
+func (r *Runner) CompleteStep(step domain.PlanStep) Result {
+	return Result{
+		Success:        true,
+		StepName:       step.Tool,
+		PayloadSummary: step.Description,
+		Data:           map[string]string{"source": "logical_step"},
+	}
 }
 
 func (r *Runner) CreateDoc(ctx context.Context, plan domain.Plan, instruction string) Result {
@@ -65,20 +146,25 @@ func (r *Runner) CreateDoc(ctx context.Context, plan domain.Plan, instruction st
 	result := Result{
 		Success:        true,
 		StepName:       "doc.generate",
-		PayloadSummary: fmt.Sprintf("生成结构化 Markdown 文档：%s", path),
+		PayloadSummary: fmt.Sprintf("已生成结构化 Markdown 文档：%s", path),
 		ArtifactURL:    "/artifacts/" + fileName,
 		ArtifactPath:   path,
 		Data:           map[string]string{"source": "local_markdown"},
 	}
 
-	if r.config.EnableLarkTools {
-		if url, output, err := r.createFeishuDoc(ctx, plan.DocTitle, content); err == nil && url != "" {
-			result.ArtifactURL = url
-			result.PayloadSummary = "已创建飞书文档：" + url
-			result.Data["source"] = "feishu_doc"
+	if r.config.EnableFeishuTools {
+		url, docID, err := r.createFeishuDoc(ctx, plan.DocTitle, content)
+		if err == nil && docID != "" {
+			result.Data["source"] = "feishu_docx"
+			result.Data["feishu_document_id"] = docID
 			result.Data["local_path"] = path
-		} else if output != "" {
-			result.Data["lark_cli_output"] = output
+			result.PayloadSummary = "已通过 Go SDK 创建飞书 Docx：" + docID
+			if url != "" {
+				result.ArtifactURL = url
+				result.PayloadSummary = "已通过 Go SDK 创建飞书 Docx：" + url
+			}
+		} else if err != nil {
+			result.Data["feishu_error"] = err.Error()
 		}
 	}
 	return result
@@ -103,29 +189,28 @@ func (r *Runner) CreateSlides(ctx context.Context, plan domain.Plan) Result {
 		return failed("slide.rehearse", err)
 	}
 
-	result := Result{
-		Success:        true,
-		StepName:       "slide.generate",
-		PayloadSummary: fmt.Sprintf("生成 Slidev 演示稿：%s", path),
-		ArtifactURL:    "/artifacts/" + fileName,
-		ArtifactPath:   path,
-		Data: map[string]string{
-			"source":        "slidev_markdown",
-			"speaker_notes": "/artifacts/" + notesName,
-		},
+	select {
+	case <-ctx.Done():
+		return failed("slide.generate", ctx.Err())
+	default:
 	}
 
-	if r.config.EnableLarkTools {
-		if url, output, err := r.createFeishuSlides(ctx, plan.SlideTitle, plan.Slides); err == nil && url != "" {
-			result.ArtifactURL = url
-			result.PayloadSummary = "已创建飞书演示稿：" + url
-			result.Data["source"] = "feishu_slides"
-			result.Data["local_path"] = path
-		} else if output != "" {
-			result.Data["lark_cli_output"] = output
-		}
+	data := map[string]string{
+		"source":        "slidev_markdown",
+		"speaker_notes": "/artifacts/" + notesName,
 	}
-	return result
+	if r.config.EnableFeishuTools {
+		data["feishu_slides"] = "not_created"
+		data["feishu_slides_reason"] = "github.com/larksuite/oapi-sdk-go/v3 v3.6.1 does not expose a direct Slides create service"
+	}
+	return Result{
+		Success:        true,
+		StepName:       "slide.generate",
+		PayloadSummary: fmt.Sprintf("已生成 Slidev 演示稿：%s", path),
+		ArtifactURL:    "/artifacts/" + fileName,
+		ArtifactPath:   path,
+		Data:           data,
+	}
 }
 
 func (r *Runner) Bundle(ctx context.Context, task domain.Task, plan domain.Plan, docResult, slidesResult Result) Result {
@@ -139,6 +224,10 @@ func (r *Runner) Bundle(ctx context.Context, task domain.Task, plan domain.Plan,
 		"taskId":         task.TaskID,
 		"title":          task.Title,
 		"instruction":    task.UserInstruction,
+		"source":         task.Source,
+		"chatId":         task.ChatID,
+		"threadId":       task.ThreadID,
+		"messageId":      task.MessageID,
 		"summary":        plan.Summary,
 		"plannerSource":  plan.PlannerSource,
 		"plannerError":   plan.PlannerError,
@@ -167,7 +256,7 @@ func (r *Runner) Bundle(ctx context.Context, task domain.Task, plan domain.Plan,
 	return Result{
 		Success:        true,
 		StepName:       "archive.bundle",
-		PayloadSummary: fmt.Sprintf("汇总产物 manifest：%s", path),
+		PayloadSummary: fmt.Sprintf("已汇总产物 manifest：%s", path),
 		ArtifactURL:    "/artifacts/" + fileName,
 		ArtifactPath:   path,
 		Data:           map[string]string{"source": "local_manifest"},
@@ -175,44 +264,95 @@ func (r *Runner) Bundle(ctx context.Context, task domain.Task, plan domain.Plan,
 }
 
 func (r *Runner) createFeishuDoc(ctx context.Context, title, markdown string) (string, string, error) {
-	command := exec.CommandContext(
-		ctx,
-		r.config.LarkCLIPath,
-		"docs",
-		"+create",
-		"--api-version",
-		"v2",
-		"--as",
-		"user",
-		"--title",
-		title,
-		"--content",
-		markdownToDocxXML(title, markdown),
-	)
-	output, err := command.CombinedOutput()
-	return extractFirstURL(string(output)), string(output), err
+	if r.client == nil {
+		return "", "", errors.New("Feishu SDK client is not configured")
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = "IM-based Assistant Document"
+	}
+
+	createReq := larkdocx.NewCreateDocumentReqBuilder().
+		Body(larkdocx.NewCreateDocumentReqBodyBuilder().Title(title).Build()).
+		Build()
+	createResp, err := r.client.Docx.V1.Document.Create(ctx, createReq)
+	if err != nil {
+		return "", "", err
+	}
+	if createResp == nil {
+		return "", "", errors.New("empty Feishu Docx create response")
+	}
+	if !createResp.Success() {
+		return "", "", fmt.Errorf("Feishu Docx create failed: code=%d msg=%s", createResp.Code, createResp.Msg)
+	}
+	if createResp.Data == nil || createResp.Data.Document == nil || createResp.Data.Document.DocumentId == nil {
+		return "", "", errors.New("Feishu Docx create response missing document_id")
+	}
+
+	docID := *createResp.Data.Document.DocumentId
+	firstLevelBlockIDs, descendants, err := r.convertMarkdownToDocxBlocks(ctx, markdown)
+	if err != nil {
+		return "", docID, err
+	}
+	if len(firstLevelBlockIDs) > 0 && len(descendants) > 0 {
+		appendReq := larkdocx.NewCreateDocumentBlockDescendantReqBuilder().
+			DocumentId(docID).
+			BlockId(docID).
+			DocumentRevisionId(-1).
+			Body(larkdocx.NewCreateDocumentBlockDescendantReqBodyBuilder().
+				ChildrenId(firstLevelBlockIDs).
+				Descendants(descendants).
+				Index(0).
+				Build()).
+			Build()
+		appendResp, err := r.client.Docx.V1.DocumentBlockDescendant.Create(ctx, appendReq)
+		if err != nil {
+			return "", docID, err
+		}
+		if appendResp == nil {
+			return "", docID, errors.New("empty Feishu Docx append response")
+		}
+		if !appendResp.Success() {
+			return "", docID, fmt.Errorf("Feishu Docx append failed: code=%d msg=%s", appendResp.Code, appendResp.Msg)
+		}
+	}
+	return r.documentURL(docID), docID, nil
 }
 
-func (r *Runner) createFeishuSlides(ctx context.Context, title string, slides []domain.Slide) (string, string, error) {
-	command := exec.CommandContext(
-		ctx,
-		r.config.LarkCLIPath,
-		"slides",
-		"+create",
-		"--as",
-		"user",
-		"--title",
-		title,
-		"--slides",
-		slidesToXML(slides),
-	)
-	output, err := command.CombinedOutput()
-	return extractFirstURL(string(output)), string(output), err
+func (r *Runner) convertMarkdownToDocxBlocks(ctx context.Context, markdown string) ([]string, []*larkdocx.Block, error) {
+	markdown = strings.TrimSpace(markdown)
+	if markdown == "" {
+		return nil, nil, nil
+	}
+
+	convertReq := larkdocx.NewConvertDocumentReqBuilder().
+		Body(larkdocx.NewConvertDocumentReqBodyBuilder().
+			ContentType(larkdocx.ContentTypeMarkdown).
+			Content(markdown).
+			Build()).
+		Build()
+	convertResp, err := r.client.Docx.V1.Document.Convert(ctx, convertReq)
+	if err != nil {
+		return nil, nil, err
+	}
+	if convertResp == nil {
+		return nil, nil, errors.New("empty Feishu Docx convert response")
+	}
+	if !convertResp.Success() {
+		return nil, nil, fmt.Errorf("Feishu Docx convert failed: code=%d msg=%s", convertResp.Code, convertResp.Msg)
+	}
+	if convertResp.Data == nil {
+		return nil, nil, errors.New("Feishu Docx convert response missing data")
+	}
+	if len(convertResp.Data.FirstLevelBlockIds) == 0 || len(convertResp.Data.Blocks) == 0 {
+		return nil, nil, nil
+	}
+	return convertResp.Data.FirstLevelBlockIds, convertResp.Data.Blocks, nil
 }
 
 func renderDocument(plan domain.Plan, instruction string) string {
 	var b strings.Builder
-	b.WriteString("# " + plan.DocTitle + "\n\n")
+	b.WriteString("# " + fallbackText(plan.DocTitle, "任务文档") + "\n\n")
 	b.WriteString("_由 IM-based Intelligent Assistant 自动生成_\n\n")
 	b.WriteString("## 意图分析\n\n")
 	if plan.PlannerSource != "" {
@@ -221,9 +361,11 @@ func renderDocument(plan domain.Plan, instruction string) string {
 	if plan.PlannerError != "" {
 		b.WriteString("- LLM 规划失败原因：" + plan.PlannerError + "\n")
 	}
-	b.WriteString("- 目标：" + plan.Analysis.Objective + "\n")
-	b.WriteString("- 受众：" + plan.Analysis.Audience + "\n")
-	b.WriteString("- 交付物：" + strings.Join(plan.Analysis.Deliverables, "、") + "\n")
+	b.WriteString("- 目标：" + fallbackText(plan.Analysis.Objective, "未明确") + "\n")
+	b.WriteString("- 受众：" + fallbackText(plan.Analysis.Audience, "未明确") + "\n")
+	if len(plan.Analysis.Deliverables) > 0 {
+		b.WriteString("- 交付物：" + strings.Join(plan.Analysis.Deliverables, "、") + "\n")
+	}
 	if plan.Analysis.ContextNeeded {
 		b.WriteString("- 上下文：需要结合群聊或对话记录进一步核对\n")
 	}
@@ -249,10 +391,10 @@ func renderSlidev(plan domain.Plan) string {
 	var b strings.Builder
 	b.WriteString("---\n")
 	b.WriteString("theme: seriph\n")
-	b.WriteString("title: " + escapeYAML(plan.SlideTitle) + "\n")
+	b.WriteString("title: " + escapeYAML(fallbackText(plan.SlideTitle, "任务演示稿")) + "\n")
 	b.WriteString("class: text-center\n")
 	b.WriteString("---\n\n")
-	b.WriteString("# " + plan.SlideTitle + "\n\n")
+	b.WriteString("# " + fallbackText(plan.SlideTitle, "任务演示稿") + "\n\n")
 	b.WriteString(plan.Summary + "\n\n")
 
 	for _, slide := range plan.Slides {
@@ -271,7 +413,7 @@ func renderSlidev(plan domain.Plan) string {
 
 func renderSpeakerNotes(plan domain.Plan) string {
 	var b strings.Builder
-	b.WriteString("# " + plan.SlideTitle + " - 演讲稿\n\n")
+	b.WriteString("# " + fallbackText(plan.SlideTitle, "任务演示稿") + " - 演讲稿\n\n")
 	for i, slide := range plan.Slides {
 		b.WriteString(fmt.Sprintf("## 第 %d 页：%s\n\n", i+1, slide.Title))
 		if slide.SpeakerNote != "" {
@@ -281,40 +423,138 @@ func renderSpeakerNotes(plan domain.Plan) string {
 	return b.String()
 }
 
-func markdownToDocxXML(title, markdown string) string {
-	var b strings.Builder
-	b.WriteString("<title>" + escapeXML(title) + "</title>")
-	for _, line := range strings.Split(markdown, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "_") {
+func normalizeMessages(data *larkim.ListMessageRespData, threadID string) []string {
+	if data == nil {
+		return nil
+	}
+	items := append([]*larkim.Message(nil), data.Items...)
+	if threadID != "" {
+		threadItems := make([]*larkim.Message, 0, len(items))
+		for _, item := range items {
+			if item == nil {
+				continue
+			}
+			if stringValue(item.ThreadId) == threadID || stringValue(item.RootId) == threadID {
+				threadItems = append(threadItems, item)
+			}
+		}
+		if len(threadItems) > 0 {
+			items = threadItems
+		}
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		return stringValue(items[i].CreateTime) < stringValue(items[j].CreateTime)
+	})
+
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		if item == nil {
 			continue
 		}
-		switch {
-		case strings.HasPrefix(line, "# "):
-			b.WriteString("<h1>" + escapeXML(strings.TrimPrefix(line, "# ")) + "</h1>")
-		case strings.HasPrefix(line, "## "):
-			b.WriteString("<h2>" + escapeXML(strings.TrimPrefix(line, "## ")) + "</h2>")
-		case strings.HasPrefix(line, "- "):
-			b.WriteString("<p>• " + escapeXML(strings.TrimPrefix(line, "- ")) + "</p>")
-		default:
-			b.WriteString("<p>" + escapeXML(line) + "</p>")
+		sender := "unknown"
+		if item.Sender != nil && item.Sender.Id != nil {
+			sender = *item.Sender.Id
 		}
+		msgType := stringValue(item.MsgType)
+		content := ""
+		if item.Body != nil {
+			content = messageContentText(msgType, stringValue(item.Body.Content))
+		}
+		if strings.TrimSpace(content) == "" {
+			content = "[" + fallbackText(msgType, "message") + "]"
+		}
+		out = append(out, fmt.Sprintf("%s %s: %s", formatMessageTime(stringValue(item.CreateTime)), sender, content))
 	}
-	return b.String()
+	return out
 }
 
-func slidesToXML(slides []domain.Slide) string {
-	items := make([]string, 0, len(slides))
-	for _, slide := range slides {
-		body := strings.Join(slide.Bullets, "\\n")
-		items = append(items, fmt.Sprintf(
-			`<slide xmlns="http://www.larkoffice.com/sml/2.0"><data><shape type="text" topLeftX="80" topLeftY="80" width="800" height="120"><content textType="title"><p>%s</p></content></shape><shape type="text" topLeftX="80" topLeftY="220" width="800" height="320"><content textType="body"><p>%s</p></content></shape></data></slide>`,
-			escapeXML(slide.Title),
-			escapeXML(body),
-		))
+func messageContentText(msgType, raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
 	}
-	payload, _ := json.Marshal(items)
-	return string(payload)
+	var payload any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return raw
+	}
+	switch msgType {
+	case "text":
+		if m, ok := payload.(map[string]any); ok {
+			if text, ok := m["text"].(string); ok {
+				return strings.TrimSpace(text)
+			}
+		}
+	}
+	return strings.TrimSpace(collectJSONText(payload))
+}
+
+func collectJSONText(value any) string {
+	switch typed := value.(type) {
+	case string:
+		return typed
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text := collectJSONText(item); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, " ")
+	case map[string]any:
+		keys := []string{"text", "content", "title", "name"}
+		parts := make([]string, 0, len(typed))
+		for _, key := range keys {
+			if text := collectJSONText(typed[key]); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, " ")
+	default:
+		return ""
+	}
+}
+
+func limitFromStep(step domain.PlanStep, defaultLimit int) int {
+	limit := defaultLimit
+	if step.Args != nil {
+		if value, ok := step.Args["limit"]; ok {
+			switch typed := value.(type) {
+			case float64:
+				limit = int(typed)
+			case int:
+				limit = typed
+			case string:
+				if parsed, err := strconv.Atoi(typed); err == nil {
+					limit = parsed
+				}
+			}
+		}
+	}
+	if limit < 1 {
+		return 1
+	}
+	if limit > 50 {
+		return 50
+	}
+	return limit
+}
+
+func formatMessageTime(ms string) string {
+	if ms == "" {
+		return ""
+	}
+	value, err := strconv.ParseInt(ms, 10, 64)
+	if err != nil {
+		return ms
+	}
+	return time.UnixMilli(value).Format("2006-01-02 15:04")
+}
+
+func (r *Runner) documentURL(docID string) string {
+	if r.config.FeishuDocBaseURL == "" {
+		return ""
+	}
+	return r.config.FeishuDocBaseURL + "/docx/" + docID
 }
 
 func failed(step string, err error) Result {
@@ -333,26 +573,16 @@ func escapeYAML(value string) string {
 	return strings.ReplaceAll(value, ":", "：")
 }
 
-func escapeXML(value string) string {
-	replacer := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", "\"", "&quot;")
-	return replacer.Replace(value)
+func fallbackText(value, defaultValue string) string {
+	if strings.TrimSpace(value) == "" {
+		return defaultValue
+	}
+	return value
 }
 
-func extractFirstURL(output string) string {
-	for _, field := range strings.Fields(output) {
-		field = strings.Trim(field, "\"',")
-		if strings.HasPrefix(field, "http://") || strings.HasPrefix(field, "https://") {
-			return field
-		}
+func stringValue(value *string) string {
+	if value == nil {
+		return ""
 	}
-	return ""
-}
-
-func sanitize(value string) string {
-	value = regexp.MustCompile(`[^a-zA-Z0-9_\-\p{Han}]+`).ReplaceAllString(value, "-")
-	value = strings.Trim(value, "-")
-	if value == "" {
-		return "artifact"
-	}
-	return strings.ToLower(value)
+	return *value
 }

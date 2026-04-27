@@ -33,7 +33,7 @@ func TestCreateTaskCompletesPipeline(t *testing.T) {
 	service := New(
 		taskStore,
 		statehub.NewHub(),
-		planner.NewService(),
+		planner.NewServiceWithLLM(nil),
 		tools.NewRunner(tools.Config{ArtifactDir: t.TempDir()}),
 	)
 
@@ -79,6 +79,56 @@ func TestCreateTaskCompletesPipeline(t *testing.T) {
 	}
 }
 
+func TestGreetingTaskDoesNotCreateDocOrSlides(t *testing.T) {
+	t.Parallel()
+
+	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	taskStore, err := store.NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	service := New(
+		taskStore,
+		statehub.NewHub(),
+		planner.NewServiceWithLLM(nil),
+		tools.NewRunner(tools.Config{ArtifactDir: t.TempDir()}),
+	)
+
+	task, err := service.CreateTask(context.Background(), CreateTaskInput{
+		Title:       "你好",
+		Instruction: "你好",
+		Source:      "feishu_p2p",
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	waitFor(t, 3*time.Second, func() bool {
+		latest, err := taskStore.Get(context.Background(), task.TaskID)
+		if err != nil {
+			return false
+		}
+		return latest.Status == domain.StatusCompleted
+	})
+
+	latest, err := taskStore.Get(context.Background(), task.TaskID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if latest.DocURL != "" {
+		t.Fatalf("did not expect doc url for greeting, got %s", latest.DocURL)
+	}
+	if latest.SlidesURL != "" {
+		t.Fatalf("did not expect slides url for greeting, got %s", latest.SlidesURL)
+	}
+}
+
 func TestWaitTaskDoneReturnsCompletedTask(t *testing.T) {
 	t.Parallel()
 
@@ -96,7 +146,7 @@ func TestWaitTaskDoneReturnsCompletedTask(t *testing.T) {
 	service := New(
 		taskStore,
 		statehub.NewHub(),
-		planner.NewService(),
+		planner.NewServiceWithLLM(nil),
 		tools.NewRunner(tools.Config{ArtifactDir: t.TempDir()}),
 	)
 
@@ -154,7 +204,7 @@ func TestWaitTaskDoneTimesOut(t *testing.T) {
 	service := New(
 		taskStore,
 		statehub.NewHub(),
-		planner.NewService(),
+		planner.NewServiceWithLLM(nil),
 		tools.NewRunner(tools.Config{ArtifactDir: t.TempDir()}),
 	)
 

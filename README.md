@@ -14,7 +14,8 @@ Monorepo for the initial desktop + backend + mobile H5 implementation of the IM-
 - Manual task creation from desktop
 - Go orchestrator with task lifecycle and retry flow
 - WebSocket state sync to desktop and mobile
-- Placeholder planner and optional Lark Docs/Slides tool runner
+- Heuristic-first planner with optional Eino-backed LLM planning
+- Optional Feishu Docx tool runner via Go SDK
 
 ## Development
 
@@ -40,6 +41,7 @@ Backend supports these optional variables:
 
 - `PORT`: HTTP port, default `8080`
 - `DATABASE_URL`: SQLite DSN, default `file:agentpilot.db?_pragma=busy_timeout(5000)`
-- `OPENAI_API_KEY`: enables real planner calls if implemented later
-- `LARK_CLI_PATH`: override `lark-cli` executable path
-- `ENABLE_LARK_TOOLS`: set to `true` to run real `lark-cli` docs/slides commands
+- `ARK_API_KEY` / `ARK_BASE_URL` / `ARK_MODEL`: preferred planner model config
+- `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL`: fallback planner model config
+- `ENABLE_FEISHU_TOOLS`: set to `true` to create real Feishu Docx artifacts via Go SDK
+- `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_DOC_BASE_URL`: Feishu Docx integration config

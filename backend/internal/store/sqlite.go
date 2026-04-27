@@ -37,6 +37,9 @@ func (s *SQLiteStore) migrate() error {
 			title TEXT NOT NULL,
 			user_instruction TEXT NOT NULL,
 			source TEXT NOT NULL,
+			chat_id TEXT NOT NULL DEFAULT '',
+			thread_id TEXT NOT NULL DEFAULT '',
+			message_id TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL,
 			current_step TEXT NOT NULL,
 			progress_text TEXT NOT NULL,
@@ -52,7 +55,28 @@ func (s *SQLiteStore) migrate() error {
 			steps_json TEXT NOT NULL
 		);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	for _, column := range []struct {
+		name string
+		ddl  string
+	}{
+		{name: "chat_id", ddl: "ALTER TABLE tasks ADD COLUMN chat_id TEXT NOT NULL DEFAULT ''"},
+		{name: "thread_id", ddl: "ALTER TABLE tasks ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''"},
+		{name: "message_id", ddl: "ALTER TABLE tasks ADD COLUMN message_id TEXT NOT NULL DEFAULT ''"},
+	} {
+		ok, err := s.hasColumn("tasks", column.name)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			if _, err := s.db.Exec(column.ddl); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *SQLiteStore) Create(ctx context.Context, task domain.Task) (domain.Task, error) {
@@ -64,11 +88,13 @@ func (s *SQLiteStore) Create(ctx context.Context, task domain.Task) (domain.Task
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO tasks (
 			task_id, title, user_instruction, source, status, current_step, progress_text,
+			chat_id, thread_id, message_id,
 			doc_url, slides_url, summary, requires_action, error_message, version,
 			last_actor, created_at, updated_at, steps_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		task.TaskID, task.Title, task.UserInstruction, task.Source, task.Status, task.CurrentStep, task.ProgressText,
+		task.ChatID, task.ThreadID, task.MessageID,
 		task.DocURL, task.SlidesURL, task.Summary, boolToInt(task.RequiresAction), task.ErrorMessage, task.Version,
 		task.LastActor, task.CreatedAt.Format(time.RFC3339Nano), task.UpdatedAt.Format(time.RFC3339Nano), string(stepsJSON),
 	)
@@ -87,11 +113,13 @@ func (s *SQLiteStore) Update(ctx context.Context, task domain.Task) (domain.Task
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE tasks
 		SET title = ?, user_instruction = ?, source = ?, status = ?, current_step = ?, progress_text = ?,
+			chat_id = ?, thread_id = ?, message_id = ?,
 			doc_url = ?, slides_url = ?, summary = ?, requires_action = ?, error_message = ?,
 			version = ?, last_actor = ?, created_at = ?, updated_at = ?, steps_json = ?
 		WHERE task_id = ?
 	`,
 		task.Title, task.UserInstruction, task.Source, task.Status, task.CurrentStep, task.ProgressText,
+		task.ChatID, task.ThreadID, task.MessageID,
 		task.DocURL, task.SlidesURL, task.Summary, boolToInt(task.RequiresAction), task.ErrorMessage,
 		task.Version, task.LastActor, task.CreatedAt.Format(time.RFC3339Nano), task.UpdatedAt.Format(time.RFC3339Nano),
 		string(stepsJSON), task.TaskID,
@@ -109,6 +137,7 @@ func (s *SQLiteStore) Update(ctx context.Context, task domain.Task) (domain.Task
 func (s *SQLiteStore) Get(ctx context.Context, taskID string) (domain.Task, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT task_id, title, user_instruction, source, status, current_step, progress_text,
+			chat_id, thread_id, message_id,
 			doc_url, slides_url, summary, requires_action, error_message, version,
 			last_actor, created_at, updated_at, steps_json
 		FROM tasks
@@ -120,6 +149,7 @@ func (s *SQLiteStore) Get(ctx context.Context, taskID string) (domain.Task, erro
 func (s *SQLiteStore) List(ctx context.Context) ([]domain.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT task_id, title, user_instruction, source, status, current_step, progress_text,
+			chat_id, thread_id, message_id,
 			doc_url, slides_url, summary, requires_action, error_message, version,
 			last_actor, created_at, updated_at, steps_json
 		FROM tasks
@@ -155,6 +185,7 @@ func scanTask(row scanner) (domain.Task, error) {
 	)
 	err := row.Scan(
 		&task.TaskID, &task.Title, &task.UserInstruction, &task.Source, &task.Status, &task.CurrentStep, &task.ProgressText,
+		&task.ChatID, &task.ThreadID, &task.MessageID,
 		&task.DocURL, &task.SlidesURL, &task.Summary, &requiresFlag, &task.ErrorMessage, &task.Version,
 		&task.LastActor, &createdAt, &updatedAt, &stepsJSON,
 	)
@@ -167,6 +198,32 @@ func scanTask(row scanner) (domain.Task, error) {
 	task.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
 	_ = json.Unmarshal([]byte(stepsJSON), &task.Steps)
 	return task, nil
+}
+
+func (s *SQLiteStore) hasColumn(table, column string) (bool, error) {
+	rows, err := s.db.Query("PRAGMA table_info(" + table + ")")
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultVal any
+			pk         int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 func boolToInt(value bool) int {

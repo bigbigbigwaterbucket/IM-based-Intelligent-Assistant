@@ -58,6 +58,9 @@ func (h *Handler) HandleMessage(ctx context.Context, event *larkim.P2MessageRece
 		Title:       taskTitle(cmd.Intent),
 		Instruction: cmd.Intent,
 		Source:      sourceForChatType(in.chatType),
+		ChatID:      in.chatID,
+		ThreadID:    in.threadID,
+		MessageID:   in.messageID,
 	})
 	if err != nil {
 		return h.messenger.ReplyText(ctx, in.messageID, "Assistant 启动失败："+err.Error())
@@ -140,6 +143,8 @@ type incomingMessage struct {
 	messageType string
 	content     string
 	chatType    string
+	chatID      string
+	threadID    string
 }
 
 func eventInput(event *larkim.P2MessageReceiveV1) (incomingMessage, bool) {
@@ -156,6 +161,8 @@ func eventInput(event *larkim.P2MessageReceiveV1) (incomingMessage, bool) {
 		messageType: stringValue(message.MessageType),
 		content:     stringValue(message.Content),
 		chatType:    stringValue(message.ChatType),
+		chatID:      stringValue(message.ChatId),
+		threadID:    stringValue(message.ThreadId),
 	}
 	if in.messageID == "" {
 		return incomingMessage{}, false

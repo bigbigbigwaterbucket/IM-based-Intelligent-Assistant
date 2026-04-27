@@ -19,6 +19,9 @@ type CreateTaskInput struct {
 	Title       string `json:"title"`
 	Instruction string `json:"instruction"`
 	Source      string `json:"source"`
+	ChatID      string `json:"chatId"`
+	ThreadID    string `json:"threadId"`
+	MessageID   string `json:"messageId"`
 }
 
 type ActionInput struct {
@@ -30,11 +33,11 @@ type ActionInput struct {
 type Service struct {
 	store   store.TaskRepository
 	hub     *statehub.Hub
-	planner *planner.Service
+	planner planner.Builder
 	tools   *tools.Runner
 }
 
-func New(taskStore store.TaskRepository, hub *statehub.Hub, plannerSvc *planner.Service, toolRunner *tools.Runner) *Service {
+func New(taskStore store.TaskRepository, hub *statehub.Hub, plannerSvc planner.Builder, toolRunner *tools.Runner) *Service {
 	return &Service{
 		store:   taskStore,
 		hub:     hub,
@@ -54,6 +57,9 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (domain
 		Title:           input.Title,
 		UserInstruction: input.Instruction,
 		Source:          fallback(input.Source, "desktop"),
+		ChatID:          input.ChatID,
+		ThreadID:        input.ThreadID,
+		MessageID:       input.MessageID,
 		Status:          domain.StatusCreated,
 		CurrentStep:     "created",
 		ProgressText:    "任务已创建，等待规划",
@@ -187,50 +193,21 @@ func (s *Service) runTask(ctx context.Context, taskID string) {
 		completeLatestStep(current)
 		current.Summary = plan.Summary
 		current.Status = domain.StatusExecuting
-		current.CurrentStep = "generate_doc"
-		current.ProgressText = fmt.Sprintf("规划完成：%d 个步骤，正在生成方案文档", len(plan.Steps))
-		current.Steps = append(current.Steps, newStep("generate_doc", "生成方案文档", domain.StepRunning, plan.DocTitle))
+		current.CurrentStep = "execute_plan"
+		current.ProgressText = fmt.Sprintf("规划完成：%d 个步骤，开始按工具计划执行", len(plan.Steps))
 	})
 
-	docResult := s.tools.CreateDoc(ctx, plan, task.UserInstruction)
-	if !docResult.Success {
-		s.failTask(ctx, taskID, "文档生成失败: "+docResult.ErrorMessage, true)
+	task, err = s.executePlan(ctx, task, plan)
+	if err != nil {
+		s.failTask(ctx, taskID, err.Error(), true)
 		return
 	}
 
 	task = s.updateTask(ctx, task, func(current *domain.Task) {
-		completeLatestStep(current)
-		current.DocURL = docResult.ArtifactURL
-		current.ProgressText = "文档已生成，正在生成演示稿与演讲稿"
-		current.CurrentStep = "generate_slides"
-		current.Steps = append(current.Steps, newStep("generate_slides", "生成演示稿", domain.StepRunning, plan.SlideTitle))
-	})
-	s.hub.Broadcast("artifact.updated", taskID, task.Version, task)
-
-	slidesResult := s.tools.CreateSlides(ctx, plan)
-	if !slidesResult.Success {
-		s.failTask(ctx, taskID, "演示稿生成失败: "+slidesResult.ErrorMessage, true)
-		return
-	}
-
-	task = s.updateTask(ctx, task, func(current *domain.Task) {
-		completeLatestStep(current)
-		current.SlidesURL = slidesResult.ArtifactURL
-		current.ProgressText = "演示稿已生成，正在汇总产物"
-		current.CurrentStep = "archive_bundle"
-		current.Steps = append(current.Steps, newStep("archive_bundle", "汇总产物", domain.StepRunning, "生成 manifest 并整理交付链接"))
-	})
-	s.hub.Broadcast("artifact.updated", taskID, task.Version, task)
-
-	bundleResult := s.tools.Bundle(ctx, task, plan, docResult, slidesResult)
-	if !bundleResult.Success {
-		s.failTask(ctx, taskID, "产物汇总失败: "+bundleResult.ErrorMessage, true)
-		return
-	}
-
-	task = s.updateTask(ctx, task, func(current *domain.Task) {
-		completeLatestStep(current)
-		current.ProgressText = "文档、演示稿与产物清单均已生成"
+		if len(current.Steps) > 0 && current.Steps[len(current.Steps)-1].Status == domain.StepRunning {
+			completeLatestStep(current)
+		}
+		current.ProgressText = completionText(*current)
 		current.CurrentStep = "completed"
 		current.Status = domain.StatusCompleted
 		current.Summary = plan.Summary
@@ -238,6 +215,88 @@ func (s *Service) runTask(ctx context.Context, taskID string) {
 	})
 
 	s.hub.Broadcast("artifact.updated", taskID, task.Version, task)
+}
+
+func (s *Service) executePlan(ctx context.Context, task domain.Task, plan domain.Plan) (domain.Task, error) {
+	var docResult tools.Result
+	var slidesResult tools.Result
+	docGenerated := false
+	slidesGenerated := false
+	executed := false
+
+	for _, step := range plan.Steps {
+		if isLogicalStep(step.Tool) {
+			continue
+		}
+		executed = true
+		task = s.updateTask(ctx, task, func(current *domain.Task) {
+			current.CurrentStep = step.Tool
+			current.ProgressText = step.Description
+			current.Steps = append(current.Steps, newStep(step.ID, toolDisplayName(step.Tool), domain.StepRunning, step.Description))
+		})
+		if task.TaskID == "" {
+			return domain.Task{}, errors.New("任务状态更新失败")
+		}
+
+		result := s.runToolStep(ctx, task, plan, step, &docResult, &slidesResult, &docGenerated, &slidesGenerated)
+		if !result.Success {
+			return task, fmt.Errorf("%s 失败: %s", step.Tool, result.ErrorMessage)
+		}
+
+		task = s.updateTask(ctx, task, func(current *domain.Task) {
+			completeLatestStep(current)
+			if docResult.ArtifactURL != "" {
+				current.DocURL = docResult.ArtifactURL
+			}
+			if slidesResult.ArtifactURL != "" {
+				current.SlidesURL = slidesResult.ArtifactURL
+			}
+			current.ProgressText = result.PayloadSummary
+		})
+		s.hub.Broadcast("artifact.updated", task.TaskID, task.Version, task)
+	}
+
+	if !executed {
+		task = s.updateTask(ctx, task, func(current *domain.Task) {
+			current.ProgressText = "规划结果不需要调用产物工具，已完成"
+		})
+	}
+	return task, nil
+}
+
+func (s *Service) runToolStep(ctx context.Context, task domain.Task, plan domain.Plan, step domain.PlanStep, docResult, slidesResult *tools.Result, docGenerated, slidesGenerated *bool) tools.Result {
+	switch step.Tool {
+	case "im.fetch_thread", "im.context_summarize":
+		return s.tools.FetchThread(ctx, task, step)
+	case "doc.create", "doc.append", "doc.generate":
+		if *docGenerated {
+			return s.tools.CompleteStep(step)
+		}
+		*docResult = s.tools.CreateDoc(ctx, plan, task.UserInstruction)
+		*docGenerated = docResult.Success
+		return *docResult
+	case "slide.generate":
+		if *slidesGenerated {
+			return s.tools.CompleteStep(step)
+		}
+		*slidesResult = s.tools.CreateSlides(ctx, plan)
+		*slidesGenerated = slidesResult.Success
+		return *slidesResult
+	case "slide.rehearse":
+		if *slidesGenerated {
+			return s.tools.CompleteStep(step)
+		}
+		*slidesResult = s.tools.CreateSlides(ctx, plan)
+		*slidesGenerated = slidesResult.Success
+		return *slidesResult
+	case "archive.bundle":
+		return s.tools.Bundle(ctx, task, plan, *docResult, *slidesResult)
+	case "sync.broadcast":
+		s.hub.Broadcast("sync.broadcast", task.TaskID, task.Version, task)
+		return s.tools.CompleteStep(step)
+	default:
+		return s.tools.CompleteStep(step)
+	}
 }
 
 func (s *Service) finishTask(ctx context.Context, taskID string) {
@@ -334,4 +393,47 @@ func fallback(value, defaultValue string) string {
 		return defaultValue
 	}
 	return value
+}
+
+func isLogicalStep(tool string) bool {
+	switch tool {
+	case "intent.analyze", "planner.build":
+		return true
+	default:
+		return false
+	}
+}
+
+func toolDisplayName(tool string) string {
+	switch tool {
+	case "im.fetch_thread", "im.context_summarize":
+		return "读取 IM 上下文"
+	case "doc.create":
+		return "创建文档"
+	case "doc.append", "doc.generate":
+		return "写入文档"
+	case "slide.generate":
+		return "生成演示稿"
+	case "slide.rehearse":
+		return "生成演讲稿"
+	case "archive.bundle":
+		return "汇总产物"
+	case "sync.broadcast":
+		return "广播状态"
+	default:
+		return tool
+	}
+}
+
+func completionText(task domain.Task) string {
+	switch {
+	case task.DocURL != "" && task.SlidesURL != "":
+		return "文档、演示稿与产物清单均已生成"
+	case task.DocURL != "":
+		return "文档已生成"
+	case task.SlidesURL != "":
+		return "演示稿已生成"
+	default:
+		return "无需生成文档或演示稿，任务已完成"
+	}
 }

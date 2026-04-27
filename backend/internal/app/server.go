@@ -54,9 +54,11 @@ func NewServer() (*Server, error) {
 	hub := statehub.NewHub()
 	planSvc := planner.NewService()
 	toolRunner := tools.NewRunner(tools.Config{
-		LarkCLIPath:     envOrDefault("LARK_CLI_PATH", "lark-cli"),
-		EnableLarkTools: strings.EqualFold(os.Getenv("ENABLE_LARK_TOOLS"), "true"),
-		ArtifactDir:     envOrDefault("ARTIFACT_DIR", tools.ArtifactDir()),
+		FeishuAppID:       os.Getenv("FEISHU_APP_ID"),
+		FeishuAppSecret:   os.Getenv("FEISHU_APP_SECRET"),
+		EnableFeishuTools: envFlag("ENABLE_FEISHU_TOOLS") || envFlag("ENABLE_LARK_TOOLS"),
+		FeishuDocBaseURL:  os.Getenv("FEISHU_DOC_BASE_URL"),
+		ArtifactDir:       envOrDefault("ARTIFACT_DIR", tools.ArtifactDir()),
 	})
 	orch := orchestrator.New(taskStore, hub, planSvc, toolRunner)
 
@@ -207,4 +209,8 @@ func envOrDefault(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func envFlag(key string) bool {
+	return strings.EqualFold(os.Getenv(key), "true") || os.Getenv(key) == "1"
 }

@@ -46,6 +46,12 @@ func TestHandleMessageStartsP2PTaskAndRepliesDone(t *testing.T) {
 	if launcher.lastInput.Source != "feishu_p2p" {
 		t.Fatalf("unexpected source: %s", launcher.lastInput.Source)
 	}
+	if launcher.lastInput.ChatID != "oc_test" {
+		t.Fatalf("unexpected chat id: %s", launcher.lastInput.ChatID)
+	}
+	if launcher.lastInput.MessageID != "om_test" {
+		t.Fatalf("unexpected message id: %s", launcher.lastInput.MessageID)
+	}
 	replies := messenger.replies()
 	if !strings.Contains(strings.Join(replies, "\n"), "实时进度：https://dashboard.example/?taskId=task-1") {
 		t.Fatalf("expected dashboard link in replies: %#v", replies)
@@ -179,11 +185,15 @@ func (f *fakeMessenger) replies() []string {
 
 func receiveEvent(chatType, messageType, content, senderType string) *larkim.P2MessageReceiveV1 {
 	messageID := "om_test"
+	chatID := "oc_test"
+	threadID := "omt_test"
 	return &larkim.P2MessageReceiveV1{
 		Event: &larkim.P2MessageReceiveV1Data{
 			Sender: &larkim.EventSender{SenderType: &senderType},
 			Message: &larkim.EventMessage{
 				MessageId:   &messageID,
+				ChatId:      &chatID,
+				ThreadId:    &threadID,
 				ChatType:    &chatType,
 				MessageType: &messageType,
 				Content:     &content,

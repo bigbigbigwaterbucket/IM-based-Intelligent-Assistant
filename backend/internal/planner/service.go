@@ -10,15 +10,28 @@ import (
 )
 
 type Service struct {
-	llm *LLMPlanner
+	llm llmBuilder
+}
+
+type Builder interface {
+	BuildPlan(ctx context.Context, title, instruction string) (domain.Plan, error)
+}
+
+type llmBuilder interface {
+	Builder
+	Enabled() bool
 }
 
 func NewService() *Service {
 	return &Service{llm: NewLLMPlannerFromEnv()}
 }
 
-func NewServiceWithLLM(llm *LLMPlanner) *Service {
+func NewServiceWithPlanner(llm llmBuilder) *Service {
 	return &Service{llm: llm}
+}
+
+func NewServiceWithLLM(llm llmBuilder) *Service {
+	return NewServiceWithPlanner(llm)
 }
 
 func (s *Service) BuildPlan(ctx context.Context, title, instruction string) (domain.Plan, error) {
@@ -72,17 +85,34 @@ func buildHeuristicPlan(title, instruction string) (domain.Plan, error) {
 }
 
 func validPlan(plan domain.Plan) bool {
+	needsDoc := planNeedsDoc(plan)
+	needsSlides := planNeedsSlides(plan)
+	if hasDeliverable(plan.Analysis, "方案文档") && !needsDoc {
+		return false
+	}
+	if hasDeliverable(plan.Analysis, "演示稿") && !needsSlides {
+		return false
+	}
 	return plan.Summary != "" &&
-		plan.DocTitle != "" &&
-		plan.SlideTitle != "" &&
 		plan.Analysis.Objective != "" &&
 		len(plan.Steps) > 0 &&
-		len(plan.DocumentSections) > 0 &&
-		len(plan.Slides) > 0
+		(!needsDoc || (plan.DocTitle != "" && len(plan.DocumentSections) > 0)) &&
+		(!needsSlides || (plan.SlideTitle != "" && len(plan.Slides) > 0))
 }
 
 func analyzeIntent(instruction string) domain.IntentAnalysis {
 	lower := strings.ToLower(instruction)
+	if isGreeting(instruction) {
+		return domain.IntentAnalysis{
+			Objective:      "识别到用户只是打招呼或测试在线状态，当前不需要启动文档或演示稿生成。",
+			Audience:       "用户本人",
+			Deliverables:   []string{},
+			ContextNeeded:  false,
+			Risks:          []string{"如果直接生成文档或演示稿，会偏离用户真实意图。"},
+			ClarifyingHint: "可以直接回复问候，并提示用户输入 /assistant <具体需求> 来启动任务。",
+		}
+	}
+
 	deliverables := make([]string, 0, 2)
 	if matchAny(instruction, `文档|方案|需求|纪要|总结|报告`) {
 		deliverables = append(deliverables, "方案文档")
@@ -127,21 +157,52 @@ func buildSteps(analysis domain.IntentAnalysis) []domain.PlanStep {
 		{ID: "s1", Tool: "intent.analyze", Description: "分析用户意图、受众、交付物和风险"},
 		{ID: "s2", Tool: "planner.build", Description: "拆解文档与演示稿生成计划", DependsOn: []string{"s1"}},
 	}
+	if len(analysis.Deliverables) == 0 {
+		return append(steps, domain.PlanStep{
+			ID:          "s3",
+			Tool:        "sync.broadcast",
+			Description: "回复问候并等待用户输入具体任务",
+			DependsOn:   []string{"s2"},
+		})
+	}
+
 	if analysis.ContextNeeded {
 		steps = append(steps, domain.PlanStep{
 			ID:          "s3",
-			Tool:        "im.context_summarize",
+			Tool:        "im.fetch_thread",
 			Description: "整理群聊或对话上下文，提取背景、结论和待办",
 			DependsOn:   []string{"s2"},
 		})
 	}
 
 	last := steps[len(steps)-1].ID
-	steps = append(steps,
-		domain.PlanStep{ID: "s4", Tool: "doc.generate", Description: "生成结构化方案文档 Markdown", DependsOn: []string{last}},
-		domain.PlanStep{ID: "s5", Tool: "slide.generate", Description: "生成 Slidev 演示稿 Markdown 与演讲稿", DependsOn: []string{"s4"}},
-		domain.PlanStep{ID: "s6", Tool: "archive.bundle", Description: "汇总所有产物并生成 manifest", DependsOn: []string{"s4", "s5"}},
-	)
+	artifactDeps := make([]string, 0, 2)
+	nextID := len(steps) + 1
+	if hasDeliverable(analysis, "方案文档") {
+		docCreateID := fmt.Sprintf("s%d", nextID)
+		nextID++
+		steps = append(steps, domain.PlanStep{ID: docCreateID, Tool: "doc.create", Description: "创建结构化方案文档", DependsOn: []string{last}})
+		docAppendID := fmt.Sprintf("s%d", nextID)
+		nextID++
+		steps = append(steps, domain.PlanStep{ID: docAppendID, Tool: "doc.append", Description: "写入方案文档内容", DependsOn: []string{docCreateID}})
+		artifactDeps = append(artifactDeps, docAppendID)
+	}
+	if hasDeliverable(analysis, "演示稿") {
+		slideID := fmt.Sprintf("s%d", nextID)
+		nextID++
+		deps := []string{last}
+		if len(artifactDeps) > 0 {
+			deps = []string{artifactDeps[len(artifactDeps)-1]}
+		}
+		steps = append(steps, domain.PlanStep{ID: slideID, Tool: "slide.generate", Description: "生成 Slidev 演示稿 Markdown", DependsOn: deps})
+		rehearseID := fmt.Sprintf("s%d", nextID)
+		nextID++
+		steps = append(steps, domain.PlanStep{ID: rehearseID, Tool: "slide.rehearse", Description: "生成演讲稿", DependsOn: []string{slideID}})
+		artifactDeps = append(artifactDeps, rehearseID)
+	}
+	if len(artifactDeps) > 0 {
+		steps = append(steps, domain.PlanStep{ID: fmt.Sprintf("s%d", nextID), Tool: "archive.bundle", Description: "汇总所有产物并生成 manifest", DependsOn: artifactDeps})
+	}
 	return steps
 }
 
@@ -300,4 +361,24 @@ func clarifyingHint(instruction string) string {
 
 func matchAny(value, pattern string) bool {
 	return regexp.MustCompile(pattern).MatchString(value)
+}
+
+func isGreeting(instruction string) bool {
+	normalized := strings.TrimSpace(strings.ToLower(instruction))
+	normalized = strings.Trim(normalized, "。.!！?？~～ ")
+	switch normalized {
+	case "你好", "您好", "hello", "hi", "hey", "在吗", "测试", "test":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasDeliverable(analysis domain.IntentAnalysis, value string) bool {
+	for _, deliverable := range analysis.Deliverables {
+		if strings.Contains(deliverable, value) {
+			return true
+		}
+	}
+	return false
 }

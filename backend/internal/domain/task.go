@@ -27,6 +27,9 @@ type Task struct {
 	Title           string     `json:"title"`
 	UserInstruction string     `json:"userInstruction"`
 	Source          string     `json:"source"`
+	ChatID          string     `json:"chatId,omitempty"`
+	ThreadID        string     `json:"threadId,omitempty"`
+	MessageID       string     `json:"messageId,omitempty"`
 	Status          TaskStatus `json:"status"`
 	CurrentStep     string     `json:"currentStep"`
 	ProgressText    string     `json:"progressText"`
@@ -77,6 +80,7 @@ type PlanStep struct {
 	ID          string
 	Tool        string
 	Description string
+	Args        map[string]any
 	DependsOn   []string
 }
 
