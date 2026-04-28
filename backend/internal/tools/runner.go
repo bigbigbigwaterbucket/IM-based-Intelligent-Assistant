@@ -131,14 +131,14 @@ func (r *Runner) CompleteStep(step domain.PlanStep) Result {
 	}
 }
 
-func (r *Runner) CreateDoc(ctx context.Context, plan domain.Plan, instruction string) Result {
+func (r *Runner) CreateDoc(ctx context.Context, plan domain.Plan, instruction string, contextResult Result) Result {
 	if err := os.MkdirAll(r.config.ArtifactDir, 0755); err != nil {
 		return failed("doc.generate", err)
 	}
 
 	fileName := fmt.Sprintf("doc_%s.md", artifactID())
 	path := filepath.Join(r.config.ArtifactDir, fileName)
-	content := renderDocument(plan, instruction)
+	content := renderDocument(plan, instruction, contextResult)
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return failed("doc.generate", err)
 	}
@@ -350,32 +350,23 @@ func (r *Runner) convertMarkdownToDocxBlocks(ctx context.Context, markdown strin
 	return convertResp.Data.FirstLevelBlockIds, convertResp.Data.Blocks, nil
 }
 
-func renderDocument(plan domain.Plan, instruction string) string {
+func renderDocument(plan domain.Plan, instruction string, contextResult Result) string {
 	var b strings.Builder
-	b.WriteString("# " + fallbackText(plan.DocTitle, "任务文档") + "\n\n")
+	b.WriteString("# " + fallbackText(plan.DocTitle, "聊天消息总结") + "\n\n")
 	b.WriteString("_由 IM-based Intelligent Assistant 自动生成_\n\n")
-	b.WriteString("## 意图分析\n\n")
-	if plan.PlannerSource != "" {
-		b.WriteString("- 规划来源：" + plan.PlannerSource + "\n")
-	}
-	if plan.PlannerError != "" {
-		b.WriteString("- LLM 规划失败原因：" + plan.PlannerError + "\n")
-	}
-	b.WriteString("- 目标：" + fallbackText(plan.Analysis.Objective, "未明确") + "\n")
-	b.WriteString("- 受众：" + fallbackText(plan.Analysis.Audience, "未明确") + "\n")
-	if len(plan.Analysis.Deliverables) > 0 {
-		b.WriteString("- 交付物：" + strings.Join(plan.Analysis.Deliverables, "、") + "\n")
-	}
-	if plan.Analysis.ContextNeeded {
-		b.WriteString("- 上下文：需要结合群聊或对话记录进一步核对\n")
-	}
-	b.WriteString("- 原始需求：" + instruction + "\n\n")
 
-	b.WriteString("## 执行计划\n\n")
-	for _, step := range plan.Steps {
-		b.WriteString(fmt.Sprintf("- `%s` %s：%s\n", step.ID, step.Tool, step.Description))
+	messages := chatMessagesFromResult(contextResult)
+	if len(messages) > 0 {
+		writeChatSummary(&b, messages, instruction)
+		return b.String()
 	}
-	b.WriteString("\n")
+
+	if reason := missingContextReason(contextResult); reason != "" {
+		b.WriteString("## 摘要\n\n")
+		b.WriteString("- 未获取到可用于总结的聊天消息，当前文档只保留用户需求和待补充信息。\n")
+		b.WriteString("- 原因：" + reason + "\n")
+		b.WriteString("- 用户需求：" + instruction + "\n\n")
+	}
 
 	for _, section := range plan.DocumentSections {
 		b.WriteString("## " + section.Heading + "\n\n")
@@ -385,6 +376,181 @@ func renderDocument(plan domain.Plan, instruction string) string {
 		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+type chatMessage struct {
+	Time    string
+	Sender  string
+	Content string
+}
+
+func chatMessagesFromResult(result Result) []chatMessage {
+	if result.Data == nil {
+		return nil
+	}
+	raw := strings.TrimSpace(result.Data["messages"])
+	if raw == "" {
+		return nil
+	}
+	lines := strings.Split(raw, "\n")
+	messages := make([]chatMessage, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		messages = append(messages, parseChatMessageLine(line))
+	}
+	return messages
+}
+
+func parseChatMessageLine(line string) chatMessage {
+	msg := chatMessage{Content: line}
+	const layout = "2006-01-02 15:04"
+	if len(line) > len(layout) {
+		timePart := line[:len(layout)]
+		rest := strings.TrimSpace(line[len(layout):])
+		if _, err := time.Parse(layout, timePart); err == nil {
+			msg.Time = timePart
+			msg.Content = rest
+		}
+	}
+	if idx := strings.Index(msg.Content, ": "); idx > 0 {
+		msg.Sender = strings.TrimSpace(msg.Content[:idx])
+		msg.Content = strings.TrimSpace(msg.Content[idx+2:])
+	}
+	return msg
+}
+
+func writeChatSummary(b *strings.Builder, messages []chatMessage, instruction string) {
+	usable := make([]chatMessage, 0, len(messages))
+	for _, msg := range messages {
+		if isAssistantCommand(msg.Content) {
+			continue
+		}
+		usable = append(usable, msg)
+	}
+
+	b.WriteString("## 摘要\n\n")
+	b.WriteString(fmt.Sprintf("- 已读取聊天消息 %d 条。", len(messages)))
+	if len(usable) != len(messages) {
+		b.WriteString(fmt.Sprintf("其中 %d 条为触发助手的命令，已从内容摘要中排除。", len(messages)-len(usable)))
+	}
+	b.WriteString("\n")
+	if len(usable) == 0 {
+		b.WriteString("- 未读取到除助手触发命令之外的可总结聊天内容。\n")
+		b.WriteString("- 用户需求：" + instruction + "\n\n")
+		writeRawMessages(b, messages)
+		return
+	}
+
+	if first, last := usable[0], usable[len(usable)-1]; first.Time != "" || last.Time != "" {
+		b.WriteString("- 时间范围：" + fallbackText(first.Time, "未知") + " 至 " + fallbackText(last.Time, "未知") + "\n")
+	}
+	participants := messageParticipants(usable)
+	if len(participants) > 0 {
+		b.WriteString("- 参与者：" + strings.Join(participants, "、") + "\n")
+	}
+	b.WriteString("\n")
+
+	b.WriteString("## 关键内容\n\n")
+	for _, msg := range usable {
+		content := strings.TrimSpace(msg.Content)
+		if content == "" {
+			continue
+		}
+		prefix := ""
+		if msg.Sender != "" {
+			prefix = msg.Sender + "："
+		}
+		b.WriteString("- " + prefix + truncateText(content, 220) + "\n")
+	}
+	b.WriteString("\n")
+
+	todos := extractActionItems(usable)
+	if len(todos) > 0 {
+		b.WriteString("## 待办与结论\n\n")
+		for _, item := range todos {
+			b.WriteString("- " + item + "\n")
+		}
+		b.WriteString("\n")
+	}
+
+	writeRawMessages(b, messages)
+}
+
+func writeRawMessages(b *strings.Builder, messages []chatMessage) {
+	b.WriteString("## 原始消息摘录\n\n")
+	for _, msg := range messages {
+		parts := make([]string, 0, 2)
+		if msg.Time != "" {
+			parts = append(parts, msg.Time)
+		}
+		if msg.Sender != "" {
+			parts = append(parts, msg.Sender)
+		}
+		prefix := ""
+		if len(parts) > 0 {
+			prefix = strings.Join(parts, " ") + "："
+		}
+		b.WriteString("- " + prefix + msg.Content + "\n")
+	}
+	b.WriteString("\n")
+}
+
+func messageParticipants(messages []chatMessage) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0)
+	for _, msg := range messages {
+		if msg.Sender == "" {
+			continue
+		}
+		if _, ok := seen[msg.Sender]; ok {
+			continue
+		}
+		seen[msg.Sender] = struct{}{}
+		out = append(out, msg.Sender)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func extractActionItems(messages []chatMessage) []string {
+	keywords := []string{"待办", "todo", "TODO", "负责", "跟进", "确认", "截止", "明天", "今天", "下周", "完成"}
+	out := make([]string, 0)
+	for _, msg := range messages {
+		for _, keyword := range keywords {
+			if strings.Contains(msg.Content, keyword) {
+				out = append(out, truncateText(msg.Content, 220))
+				break
+			}
+		}
+	}
+	return out
+}
+
+func isAssistantCommand(text string) bool {
+	return strings.HasPrefix(strings.TrimSpace(text), "/assistant")
+}
+
+func missingContextReason(result Result) string {
+	if result.PayloadSummary != "" {
+		return result.PayloadSummary
+	}
+	if result.Data != nil {
+		if source := result.Data["source"]; source != "" {
+			return source
+		}
+	}
+	return ""
+}
+
+func truncateText(text string, maxRunes int) string {
+	runes := []rune(strings.TrimSpace(text))
+	if len(runes) <= maxRunes {
+		return string(runes)
+	}
+	return string(runes[:maxRunes]) + "..."
 }
 
 func renderSlidev(plan domain.Plan) string {

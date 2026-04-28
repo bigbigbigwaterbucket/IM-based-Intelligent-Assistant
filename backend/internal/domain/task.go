@@ -95,6 +95,41 @@ type Slide struct {
 	SpeakerNote string
 }
 
+type Session struct {
+	SessionID string    `json:"sessionId"`
+	TaskID    string    `json:"taskId"`
+	ChatID    string    `json:"chatId,omitempty"`
+	ThreadID  string    `json:"threadId,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+type ConversationMessage struct {
+	MessageID string    `json:"messageId"`
+	SessionID string    `json:"sessionId"`
+	Role      string    `json:"role"`
+	Content   string    `json:"content"`
+	Metadata  string    `json:"metadata,omitempty"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+type ToolInvocation struct {
+	InvocationID   string    `json:"invocationId"`
+	SessionID      string    `json:"sessionId"`
+	TaskID         string    `json:"taskId"`
+	StepID         string    `json:"stepId"`
+	ToolName       string    `json:"toolName"`
+	ArgumentsJSON  string    `json:"argumentsJson"`
+	ResultSummary  string    `json:"resultSummary"`
+	ResultJSON     string    `json:"resultJson"`
+	ErrorMessage   string    `json:"errorMessage,omitempty"`
+	ArtifactURL    string    `json:"artifactUrl,omitempty"`
+	ArtifactPath   string    `json:"artifactPath,omitempty"`
+	StartedAt      time.Time `json:"startedAt"`
+	CompletedAt    time.Time `json:"completedAt"`
+	DurationMillis int64     `json:"durationMillis"`
+}
+
 type ActionType string
 
 const (

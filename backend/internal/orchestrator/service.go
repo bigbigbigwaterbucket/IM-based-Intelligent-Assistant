@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"agentpilot/backend/internal/agentexec"
 	"agentpilot/backend/internal/domain"
 	"agentpilot/backend/internal/planner"
 	"agentpilot/backend/internal/statehub"
@@ -31,18 +33,36 @@ type ActionInput struct {
 }
 
 type Service struct {
-	store   store.TaskRepository
-	hub     *statehub.Hub
-	planner planner.Builder
-	tools   *tools.Runner
+	store    store.TaskRepository
+	hub      *statehub.Hub
+	planner  planner.Builder
+	tools    *tools.Runner
+	executor agentexec.Executor
 }
 
 func New(taskStore store.TaskRepository, hub *statehub.Hub, plannerSvc planner.Builder, toolRunner *tools.Runner) *Service {
-	return &Service{
+	service := &Service{
 		store:   taskStore,
 		hub:     hub,
 		planner: plannerSvc,
 		tools:   toolRunner,
+	}
+	history, _ := taskStore.(store.HistoryRepository)
+	service.executor = agentexec.NewPlanExecutor(toolRunner, service, history)
+	return service
+}
+
+func NewWithExecutor(taskStore store.TaskRepository, hub *statehub.Hub, plannerSvc planner.Builder, toolRunner *tools.Runner, executor agentexec.Executor) *Service {
+	service := New(taskStore, hub, plannerSvc, toolRunner)
+	if executor != nil {
+		service.executor = executor
+	}
+	return service
+}
+
+func (s *Service) SetExecutor(executor agentexec.Executor) {
+	if executor != nil {
+		s.executor = executor
 	}
 }
 
@@ -197,27 +217,17 @@ func (s *Service) runTask(ctx context.Context, taskID string) {
 		current.ProgressText = fmt.Sprintf("规划完成：%d 个步骤，开始按工具计划执行", len(plan.Steps))
 	})
 
-	task, err = s.executePlan(ctx, task, plan)
+	task, err = s.executor.Execute(ctx, task, plan)
 	if err != nil {
 		s.failTask(ctx, taskID, err.Error(), true)
 		return
 	}
 
-	task = s.updateTask(ctx, task, func(current *domain.Task) {
-		if len(current.Steps) > 0 && current.Steps[len(current.Steps)-1].Status == domain.StepRunning {
-			completeLatestStep(current)
-		}
-		current.ProgressText = completionText(*current)
-		current.CurrentStep = "completed"
-		current.Status = domain.StatusCompleted
-		current.Summary = plan.Summary
-		current.RequiresAction = false
-	})
-
 	s.hub.Broadcast("artifact.updated", taskID, task.Version, task)
 }
 
 func (s *Service) executePlan(ctx context.Context, task domain.Task, plan domain.Plan) (domain.Task, error) {
+	var contextResult tools.Result
 	var docResult tools.Result
 	var slidesResult tools.Result
 	docGenerated := false
@@ -238,7 +248,7 @@ func (s *Service) executePlan(ctx context.Context, task domain.Task, plan domain
 			return domain.Task{}, errors.New("任务状态更新失败")
 		}
 
-		result := s.runToolStep(ctx, task, plan, step, &docResult, &slidesResult, &docGenerated, &slidesGenerated)
+		result := s.runToolStep(ctx, task, plan, step, &contextResult, &docResult, &slidesResult, &docGenerated, &slidesGenerated)
 		if !result.Success {
 			return task, fmt.Errorf("%s 失败: %s", step.Tool, result.ErrorMessage)
 		}
@@ -264,15 +274,16 @@ func (s *Service) executePlan(ctx context.Context, task domain.Task, plan domain
 	return task, nil
 }
 
-func (s *Service) runToolStep(ctx context.Context, task domain.Task, plan domain.Plan, step domain.PlanStep, docResult, slidesResult *tools.Result, docGenerated, slidesGenerated *bool) tools.Result {
+func (s *Service) runToolStep(ctx context.Context, task domain.Task, plan domain.Plan, step domain.PlanStep, contextResult, docResult, slidesResult *tools.Result, docGenerated, slidesGenerated *bool) tools.Result {
 	switch step.Tool {
 	case "im.fetch_thread", "im.context_summarize":
-		return s.tools.FetchThread(ctx, task, step)
+		*contextResult = s.tools.FetchThread(ctx, task, step)
+		return *contextResult
 	case "doc.create", "doc.append", "doc.generate":
 		if *docGenerated {
 			return s.tools.CompleteStep(step)
 		}
-		*docResult = s.tools.CreateDoc(ctx, plan, task.UserInstruction)
+		*docResult = s.tools.CreateDoc(ctx, plan, task.UserInstruction, *contextResult)
 		*docGenerated = docResult.Success
 		return *docResult
 	case "slide.generate":
@@ -297,6 +308,106 @@ func (s *Service) runToolStep(ctx context.Context, task domain.Task, plan domain
 	default:
 		return s.tools.CompleteStep(step)
 	}
+}
+
+func (s *Service) StartAgentRun(ctx context.Context, taskID string, plan domain.Plan) (domain.Task, error) {
+	task, err := s.store.Get(ctx, taskID)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	task = s.updateTask(ctx, task, func(current *domain.Task) {
+		current.Status = domain.StatusExecuting
+		current.CurrentStep = "agent_execute"
+		current.ProgressText = fmt.Sprintf("Agent is executing %d planned steps", len(plan.Steps))
+		current.Summary = plan.Summary
+		current.LastActor = "agent"
+	})
+	if task.TaskID == "" {
+		return domain.Task{}, errors.New("task state update failed")
+	}
+	return task, nil
+}
+
+func (s *Service) StartToolStep(ctx context.Context, taskID string, step domain.PlanStep) (domain.Task, error) {
+	task, err := s.store.Get(ctx, taskID)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	task = s.updateTask(ctx, task, func(current *domain.Task) {
+		current.CurrentStep = step.Tool
+		current.ProgressText = step.Description
+		current.LastActor = "agent"
+		current.Steps = append(current.Steps, newStep(step.ID, toolDisplayName(step.Tool), domain.StepRunning, step.Description))
+	})
+	if task.TaskID == "" {
+		return domain.Task{}, errors.New("task state update failed")
+	}
+	return task, nil
+}
+
+func (s *Service) CompleteToolStep(ctx context.Context, taskID string, result tools.Result) (domain.Task, error) {
+	task, err := s.store.Get(ctx, taskID)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	task = s.updateTask(ctx, task, func(current *domain.Task) {
+		completeLatestStep(current)
+		if result.ArtifactURL != "" {
+			switch {
+			case strings.HasPrefix(result.StepName, "doc."):
+				current.DocURL = result.ArtifactURL
+			case strings.HasPrefix(result.StepName, "slide."):
+				current.SlidesURL = result.ArtifactURL
+			}
+		}
+		if result.PayloadSummary != "" {
+			current.ProgressText = result.PayloadSummary
+		}
+	})
+	if task.TaskID == "" {
+		return domain.Task{}, errors.New("task state update failed")
+	}
+	s.hub.Broadcast("artifact.updated", task.TaskID, task.Version, task)
+	return task, nil
+}
+
+func (s *Service) FailToolStep(ctx context.Context, taskID string, step domain.PlanStep, err error) (domain.Task, error) {
+	task, getErr := s.store.Get(ctx, taskID)
+	if getErr != nil {
+		return domain.Task{}, getErr
+	}
+	message := fmt.Sprintf("%s failed: %s", step.Tool, err.Error())
+	task = s.updateTask(ctx, task, func(current *domain.Task) {
+		failLatestStep(current, message)
+		current.CurrentStep = step.Tool
+		current.ProgressText = message
+		current.ErrorMessage = message
+	})
+	if task.TaskID == "" {
+		return domain.Task{}, errors.New("task state update failed")
+	}
+	return task, nil
+}
+
+func (s *Service) CompleteAgentRun(ctx context.Context, taskID string, plan domain.Plan) (domain.Task, error) {
+	task, err := s.store.Get(ctx, taskID)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	task = s.updateTask(ctx, task, func(current *domain.Task) {
+		if len(current.Steps) > 0 && current.Steps[len(current.Steps)-1].Status == domain.StepRunning {
+			completeLatestStep(current)
+		}
+		current.ProgressText = completionText(*current)
+		current.CurrentStep = "completed"
+		current.Status = domain.StatusCompleted
+		current.Summary = plan.Summary
+		current.RequiresAction = false
+	})
+	if task.TaskID == "" {
+		return domain.Task{}, errors.New("task state update failed")
+	}
+	return task, nil
 }
 
 func (s *Service) finishTask(ctx context.Context, taskID string) {

@@ -9,10 +9,6 @@ import (
 	"agentpilot/backend/internal/domain"
 )
 
-type Service struct {
-	llm llmBuilder
-}
-
 type Builder interface {
 	BuildPlan(ctx context.Context, title, instruction string) (domain.Plan, error)
 }
@@ -20,6 +16,10 @@ type Builder interface {
 type llmBuilder interface {
 	Builder
 	Enabled() bool
+}
+
+type Service struct {
+	llm llmBuilder
 }
 
 func NewService() *Service {

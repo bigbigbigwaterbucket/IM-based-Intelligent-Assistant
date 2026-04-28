@@ -77,6 +77,22 @@ func TestCreateTaskCompletesPipeline(t *testing.T) {
 	if latest.Version < 4 {
 		t.Fatalf("expected version to advance, got %d", latest.Version)
 	}
+
+	messages, err := taskStore.ListMessages(context.Background(), "task:"+task.TaskID, 10)
+	if err != nil {
+		t.Fatalf("list messages: %v", err)
+	}
+	if len(messages) < 2 {
+		t.Fatalf("expected persisted session messages, got %d", len(messages))
+	}
+
+	var invocationCount int
+	if err := db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM tool_invocations WHERE task_id = ?`, task.TaskID).Scan(&invocationCount); err != nil {
+		t.Fatalf("count tool invocations: %v", err)
+	}
+	if invocationCount == 0 {
+		t.Fatal("expected persisted tool invocations")
+	}
 }
 
 func TestGreetingTaskDoesNotCreateDocOrSlides(t *testing.T) {

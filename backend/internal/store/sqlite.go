@@ -18,6 +18,13 @@ type TaskRepository interface {
 	List(ctx context.Context) ([]domain.Task, error)
 }
 
+type HistoryRepository interface {
+	UpsertSession(ctx context.Context, session domain.Session) error
+	AppendMessage(ctx context.Context, message domain.ConversationMessage) error
+	AppendToolInvocation(ctx context.Context, invocation domain.ToolInvocation) error
+	ListMessages(ctx context.Context, sessionID string, limit int) ([]domain.ConversationMessage, error)
+}
+
 type SQLiteStore struct {
 	db *sql.DB
 }
@@ -56,6 +63,46 @@ func (s *SQLiteStore) migrate() error {
 		);
 	`)
 	if err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS sessions (
+			session_id TEXT PRIMARY KEY,
+			task_id TEXT NOT NULL,
+			chat_id TEXT NOT NULL DEFAULT '',
+			thread_id TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		CREATE TABLE IF NOT EXISTS conversation_messages (
+			message_id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			role TEXT NOT NULL,
+			content TEXT NOT NULL,
+			metadata TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_conversation_messages_session_created
+			ON conversation_messages(session_id, created_at);
+		CREATE TABLE IF NOT EXISTS tool_invocations (
+			invocation_id TEXT PRIMARY KEY,
+			session_id TEXT NOT NULL,
+			task_id TEXT NOT NULL,
+			step_id TEXT NOT NULL,
+			tool_name TEXT NOT NULL,
+			arguments_json TEXT NOT NULL,
+			result_summary TEXT NOT NULL,
+			result_json TEXT NOT NULL,
+			error_message TEXT NOT NULL DEFAULT '',
+			artifact_url TEXT NOT NULL DEFAULT '',
+			artifact_path TEXT NOT NULL DEFAULT '',
+			started_at TEXT NOT NULL,
+			completed_at TEXT NOT NULL,
+			duration_millis INTEGER NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_tool_invocations_session
+			ON tool_invocations(session_id, started_at);
+	`); err != nil {
 		return err
 	}
 	for _, column := range []struct {
@@ -169,6 +216,86 @@ func (s *SQLiteStore) List(ctx context.Context) ([]domain.Task, error) {
 		tasks = append(tasks, task)
 	}
 	return tasks, rows.Err()
+}
+
+func (s *SQLiteStore) UpsertSession(ctx context.Context, session domain.Session) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO sessions (session_id, task_id, chat_id, thread_id, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(session_id) DO UPDATE SET
+			task_id = excluded.task_id,
+			chat_id = excluded.chat_id,
+			thread_id = excluded.thread_id,
+			updated_at = excluded.updated_at
+	`,
+		session.SessionID, session.TaskID, session.ChatID, session.ThreadID,
+		session.CreatedAt.Format(time.RFC3339Nano), session.UpdatedAt.Format(time.RFC3339Nano),
+	)
+	return err
+}
+
+func (s *SQLiteStore) AppendMessage(ctx context.Context, message domain.ConversationMessage) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO conversation_messages (message_id, session_id, role, content, metadata, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`,
+		message.MessageID, message.SessionID, message.Role, message.Content, message.Metadata,
+		message.CreatedAt.Format(time.RFC3339Nano),
+	)
+	return err
+}
+
+func (s *SQLiteStore) AppendToolInvocation(ctx context.Context, invocation domain.ToolInvocation) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO tool_invocations (
+			invocation_id, session_id, task_id, step_id, tool_name, arguments_json,
+			result_summary, result_json, error_message, artifact_url, artifact_path,
+			started_at, completed_at, duration_millis
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		invocation.InvocationID, invocation.SessionID, invocation.TaskID, invocation.StepID, invocation.ToolName,
+		invocation.ArgumentsJSON, invocation.ResultSummary, invocation.ResultJSON, invocation.ErrorMessage,
+		invocation.ArtifactURL, invocation.ArtifactPath, invocation.StartedAt.Format(time.RFC3339Nano),
+		invocation.CompletedAt.Format(time.RFC3339Nano), invocation.DurationMillis,
+	)
+	return err
+}
+
+func (s *SQLiteStore) ListMessages(ctx context.Context, sessionID string, limit int) ([]domain.ConversationMessage, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT message_id, session_id, role, content, metadata, created_at
+		FROM conversation_messages
+		WHERE session_id = ?
+		ORDER BY created_at DESC
+		LIMIT ?
+	`, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	reversed := make([]domain.ConversationMessage, 0, limit)
+	for rows.Next() {
+		var message domain.ConversationMessage
+		var createdAt string
+		if err := rows.Scan(&message.MessageID, &message.SessionID, &message.Role, &message.Content, &message.Metadata, &createdAt); err != nil {
+			return nil, err
+		}
+		message.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		reversed = append(reversed, message)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	messages := make([]domain.ConversationMessage, len(reversed))
+	for i := range reversed {
+		messages[len(reversed)-1-i] = reversed[i]
+	}
+	return messages, nil
 }
 
 type scanner interface {

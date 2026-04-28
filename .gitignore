@@ -46,3 +46,6 @@ yarn-error.log*
 *.db
 *.sqlite
 *.sqlite3
+
+# 用户生成产物
+pilot_artifacts/

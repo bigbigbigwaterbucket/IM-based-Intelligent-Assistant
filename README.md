@@ -43,5 +43,6 @@ Backend supports these optional variables:
 - `DATABASE_URL`: SQLite DSN, default `file:agentpilot.db?_pragma=busy_timeout(5000)`
 - `ARK_API_KEY` / `ARK_BASE_URL` / `ARK_MODEL`: preferred planner model config
 - `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_MODEL`: fallback planner model config
+- `AGENT_SKILL_DIR`: Eino skill directory, default `backend/skills` from repo root or `skills` from the backend directory
 - `ENABLE_FEISHU_TOOLS`: set to `true` to create real Feishu Docx artifacts via Go SDK
 - `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_DOC_BASE_URL`: Feishu Docx integration config

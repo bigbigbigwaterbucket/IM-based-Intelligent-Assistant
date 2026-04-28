@@ -11,6 +11,7 @@ import (
 
 	_ "modernc.org/sqlite"
 
+	"agentpilot/backend/internal/agentexec"
 	"agentpilot/backend/internal/config"
 	"agentpilot/backend/internal/larkbot"
 	"agentpilot/backend/internal/orchestrator"
@@ -61,6 +62,12 @@ func NewServer() (*Server, error) {
 		ArtifactDir:       envOrDefault("ARTIFACT_DIR", tools.ArtifactDir()),
 	})
 	orch := orchestrator.New(taskStore, hub, planSvc, toolRunner)
+	history, _ := any(taskStore).(store.HistoryRepository)
+	if einoExecutor, enabled, err := agentexec.NewADKExecutorFromEnv(context.Background(), toolRunner, orch, history); err != nil {
+		return nil, fmt.Errorf("create eino adk agent executor: %w", err)
+	} else if enabled {
+		orch.SetExecutor(einoExecutor)
+	}
 
 	shutdown := func() {}
 	botConfig := larkbot.ConfigFromEnv()
