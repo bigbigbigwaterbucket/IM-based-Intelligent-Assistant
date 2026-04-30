@@ -21,6 +21,7 @@ import (
 )
 
 const defaultArtifactDir = "data/pilot_artifacts"
+const maxFeishuDocxDescendantChildren = 1000
 
 type Config struct {
 	FeishuAppID       string
@@ -365,28 +366,137 @@ func (r *Runner) createFeishuDoc(ctx context.Context, title, markdown string) (s
 		return "", docID, err
 	}
 	if len(firstLevelBlockIDs) > 0 && len(descendants) > 0 {
+		if err := r.appendFeishuDocBlocks(ctx, docID, firstLevelBlockIDs, descendants); err != nil {
+			return "", docID, err
+		}
+	}
+	return r.documentURL(docID), docID, nil
+}
+
+func (r *Runner) appendFeishuDocBlocks(ctx context.Context, docID string, firstLevelBlockIDs []string, descendants []*larkdocx.Block) error {
+	if len(firstLevelBlockIDs) == 0 || len(descendants) == 0 {
+		return nil
+	}
+	if err := validateConvertedBlocks(firstLevelBlockIDs, descendants); err != nil {
+		return err
+	}
+
+	chunks, err := splitConvertedBlocks(firstLevelBlockIDs, descendants, maxFeishuDocxDescendantChildren)
+	if err != nil {
+		return err
+	}
+	for _, chunk := range chunks {
 		appendReq := larkdocx.NewCreateDocumentBlockDescendantReqBuilder().
 			DocumentId(docID).
 			BlockId(docID).
 			DocumentRevisionId(-1).
+			ClientToken(uuid.NewString()).
 			Body(larkdocx.NewCreateDocumentBlockDescendantReqBodyBuilder().
-				ChildrenId(firstLevelBlockIDs).
-				Descendants(descendants).
-				Index(0).
+				ChildrenId(chunk.firstLevelBlockIDs).
+				Descendants(chunk.descendants).
+				Index(-1).
 				Build()).
 			Build()
 		appendResp, err := r.client.Docx.V1.DocumentBlockDescendant.Create(ctx, appendReq)
 		if err != nil {
-			return "", docID, err
+			return err
 		}
 		if appendResp == nil {
-			return "", docID, errors.New("empty Feishu Docx append response")
+			return errors.New("empty Feishu Docx append response")
 		}
 		if !appendResp.Success() {
-			return "", docID, fmt.Errorf("Feishu Docx append failed: code=%d msg=%s", appendResp.Code, appendResp.Msg)
+			return fmt.Errorf("Feishu Docx append failed: code=%d msg=%s request_id=%s first_level_blocks=%d descendants=%d", appendResp.Code, appendResp.Msg, appendResp.RequestId(), len(chunk.firstLevelBlockIDs), len(chunk.descendants))
 		}
 	}
-	return r.documentURL(docID), docID, nil
+	return nil
+}
+
+type feishuDocBlockChunk struct {
+	firstLevelBlockIDs []string
+	descendants        []*larkdocx.Block
+}
+
+func splitConvertedBlocks(firstLevelBlockIDs []string, descendants []*larkdocx.Block, maxFirstLevel int) ([]feishuDocBlockChunk, error) {
+	if maxFirstLevel <= 0 {
+		maxFirstLevel = maxFeishuDocxDescendantChildren
+	}
+	blockByID := make(map[string]*larkdocx.Block, len(descendants))
+	for _, block := range descendants {
+		sanitizeConvertedBlock(block)
+		if block != nil && block.BlockId != nil {
+			blockByID[*block.BlockId] = block
+		}
+	}
+
+	chunks := make([]feishuDocBlockChunk, 0, (len(firstLevelBlockIDs)+maxFirstLevel-1)/maxFirstLevel)
+	for start := 0; start < len(firstLevelBlockIDs); start += maxFirstLevel {
+		end := start + maxFirstLevel
+		if end > len(firstLevelBlockIDs) {
+			end = len(firstLevelBlockIDs)
+		}
+		roots := append([]string(nil), firstLevelBlockIDs[start:end]...)
+		wanted := map[string]struct{}{}
+		for _, root := range roots {
+			collectBlockSubtree(root, blockByID, wanted)
+		}
+		chunkDescendants := make([]*larkdocx.Block, 0, len(wanted))
+		for _, block := range descendants {
+			if block == nil || block.BlockId == nil {
+				continue
+			}
+			if _, ok := wanted[*block.BlockId]; ok {
+				chunkDescendants = append(chunkDescendants, block)
+			}
+		}
+		if err := validateConvertedBlocks(roots, chunkDescendants); err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, feishuDocBlockChunk{firstLevelBlockIDs: roots, descendants: chunkDescendants})
+	}
+	return chunks, nil
+}
+
+func collectBlockSubtree(blockID string, blockByID map[string]*larkdocx.Block, wanted map[string]struct{}) {
+	if _, ok := wanted[blockID]; ok {
+		return
+	}
+	block := blockByID[blockID]
+	if block == nil {
+		return
+	}
+	wanted[blockID] = struct{}{}
+	for _, childID := range block.Children {
+		collectBlockSubtree(childID, blockByID, wanted)
+	}
+}
+
+func sanitizeConvertedBlock(block *larkdocx.Block) {
+	if block == nil {
+		return
+	}
+	block.CommentIds = nil
+	if block.Table != nil && block.Table.Property != nil {
+		block.Table.Property.MergeInfo = nil
+	}
+}
+
+func validateConvertedBlocks(firstLevelBlockIDs []string, descendants []*larkdocx.Block) error {
+	blockIDs := make(map[string]struct{}, len(descendants))
+	for _, block := range descendants {
+		if block == nil || block.BlockId == nil || strings.TrimSpace(*block.BlockId) == "" {
+			return errors.New("Feishu Docx convert returned a descendant block without block_id")
+		}
+		blockIDs[*block.BlockId] = struct{}{}
+	}
+	for _, id := range firstLevelBlockIDs {
+		if strings.TrimSpace(id) == "" {
+			return errors.New("Feishu Docx convert returned an empty first-level block id")
+		}
+		if _, ok := blockIDs[id]; !ok {
+			return fmt.Errorf("Feishu Docx convert returned first-level block id %q without matching descendant", id)
+		}
+	}
+	return nil
 }
 
 func (r *Runner) convertMarkdownToDocxBlocks(ctx context.Context, markdown string) ([]string, []*larkdocx.Block, error) {

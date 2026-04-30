@@ -4,10 +4,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"agentpilot/backend/internal/domain"
+	larkdocx "github.com/larksuite/oapi-sdk-go/v3/service/docx/v1"
 )
 
 func TestCreateDocAndSlidesWriteArtifacts(t *testing.T) {
@@ -138,6 +140,66 @@ func TestCreateSlidesUsesGeneratedMarkdownAndUpdatesNotes(t *testing.T) {
 	if got := notes.Data["notes_source"]; got != "agent_speaker_notes" {
 		t.Fatalf("expected agent notes source, got %q", got)
 	}
+}
+
+func TestValidateConvertedBlocks(t *testing.T) {
+	t.Parallel()
+
+	blockID := "tmp_block_1"
+	if err := validateConvertedBlocks([]string{blockID}, []*larkdocx.Block{{BlockId: &blockID}}); err != nil {
+		t.Fatalf("expected converted blocks to validate: %v", err)
+	}
+
+	if err := validateConvertedBlocks([]string{"missing"}, []*larkdocx.Block{{BlockId: &blockID}}); err == nil {
+		t.Fatal("expected missing first-level block to fail validation")
+	}
+}
+
+func TestSplitConvertedBlocksBatchesAboveLimit(t *testing.T) {
+	t.Parallel()
+
+	firstLevel := make([]string, 0, 1001)
+	descendants := make([]*larkdocx.Block, 0, 1002)
+	for i := 0; i < 1001; i++ {
+		id := "root_" + strconv.Itoa(i)
+		firstLevel = append(firstLevel, id)
+		block := &larkdocx.Block{BlockId: &id}
+		if i == 0 {
+			childID := "child_0"
+			block.Children = []string{childID}
+			descendants = append(descendants, &larkdocx.Block{BlockId: &childID})
+		}
+		descendants = append(descendants, block)
+	}
+
+	chunks, err := splitConvertedBlocks(firstLevel, descendants, maxFeishuDocxDescendantChildren)
+	if err != nil {
+		t.Fatalf("split converted blocks: %v", err)
+	}
+	if len(chunks) != 2 {
+		t.Fatalf("expected 2 chunks, got %d", len(chunks))
+	}
+	if got := len(chunks[0].firstLevelBlockIDs); got != maxFeishuDocxDescendantChildren {
+		t.Fatalf("expected first chunk to have %d first-level blocks, got %d", maxFeishuDocxDescendantChildren, got)
+	}
+	if got := len(chunks[1].firstLevelBlockIDs); got != 1 {
+		t.Fatalf("expected second chunk to have 1 first-level block, got %d", got)
+	}
+	if !containsBlockID(chunks[0].descendants, "child_0") {
+		t.Fatal("expected first chunk to include child subtree")
+	}
+	if containsBlockID(chunks[1].descendants, "child_0") {
+		t.Fatal("did not expect second chunk to include first chunk child subtree")
+	}
+}
+
+func containsBlockID(blocks []*larkdocx.Block, id string) bool {
+	for _, block := range blocks {
+		if block != nil && block.BlockId != nil && *block.BlockId == id {
+			return true
+		}
+	}
+	return false
 }
 
 func assertFileContains(t *testing.T, path, want string) {

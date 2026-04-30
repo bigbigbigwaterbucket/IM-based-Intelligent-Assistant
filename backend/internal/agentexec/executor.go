@@ -246,7 +246,7 @@ func (t *executionTool) InvokableRun(ctx context.Context, argumentsInJSON string
 	}
 	step := domain.PlanStep{
 		ID:          fallback(input.StepID, safeToolName(t.planName)),
-		Tool:        fallback(input.Tool, t.planName),
+		Tool:        normalizePlanTool(input.Tool, t.planName),
 		Description: fallback(input.Description, t.displayName),
 		Args:        input.Args,
 	}
@@ -469,6 +469,17 @@ func safeToolName(name string) string {
 	name = strings.ReplaceAll(name, ".", "_")
 	name = strings.ReplaceAll(name, "-", "_")
 	return name
+}
+
+func normalizePlanTool(value, defaultTool string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return defaultTool
+	}
+	if value == defaultTool || safeToolName(value) == safeToolName(defaultTool) {
+		return defaultTool
+	}
+	return value
 }
 
 func toolInfo(name, description, planName string) *schema.ToolInfo {

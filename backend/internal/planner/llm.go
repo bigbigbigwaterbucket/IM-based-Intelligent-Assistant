@@ -170,9 +170,9 @@ func (p *EinoPlanner) chatModelConfig() *openai.ChatModelConfig {
 
 func plannerConfigFromEnv() plannerModelConfig {
 	arkConfig := newPlannerModelConfig(
-		os.Getenv("ARK_API_KEY"),
-		os.Getenv("ARK_BASE_URL"),
-		os.Getenv("ARK_MODEL"),
+		os.Getenv("DEEPSEEK_API_KEY"),
+		os.Getenv("DEEPSEEK_BASE_URL"),
+		os.Getenv("DEEPSEEK_MODEL"),
 		nil,
 	)
 	if arkConfig.enabled() {
