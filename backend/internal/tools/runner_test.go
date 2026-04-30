@@ -32,7 +32,7 @@ func TestCreateDocAndSlidesWriteArtifacts(t *testing.T) {
 		},
 	}
 
-	doc := runner.CreateDoc(context.Background(), plan, "生成文档和演示稿", Result{})
+	doc := runner.CreateDoc(context.Background(), plan, "生成文档和演示稿", Result{}, "")
 	if !doc.Success {
 		t.Fatalf("create doc failed: %s", doc.ErrorMessage)
 	}
@@ -43,7 +43,7 @@ func TestCreateDocAndSlidesWriteArtifacts(t *testing.T) {
 	assertFileNotContains(t, doc.ArtifactPath, "## 意图分析")
 	assertFileNotContains(t, doc.ArtifactPath, "## 执行计划")
 
-	slides := runner.CreateSlides(context.Background(), plan)
+	slides := runner.CreateSlides(context.Background(), plan, "", "")
 	if !slides.Success {
 		t.Fatalf("create slides failed: %s", slides.ErrorMessage)
 	}
@@ -78,7 +78,7 @@ func TestCreateDocUsesFetchedChatMessages(t *testing.T) {
 		},
 	}
 
-	doc := runner.CreateDoc(context.Background(), plan, "总结下聊天消息，生成文档", contextResult)
+	doc := runner.CreateDoc(context.Background(), plan, "总结下聊天消息，生成文档", contextResult, "")
 	if !doc.Success {
 		t.Fatalf("create doc failed: %s", doc.ErrorMessage)
 	}
@@ -89,6 +89,55 @@ func TestCreateDocUsesFetchedChatMessages(t *testing.T) {
 	assertFileContains(t, doc.ArtifactPath, "## 原始消息摘录")
 	assertFileNotContains(t, doc.ArtifactPath, "## 意图分析")
 	assertFileNotContains(t, doc.ArtifactPath, "## 执行计划")
+}
+
+func TestCreateDocUsesGeneratedMarkdown(t *testing.T) {
+	t.Parallel()
+
+	runner := NewRunner(Config{ArtifactDir: t.TempDir()})
+	plan := domain.Plan{
+		DocTitle: "Generated Doc",
+		DocumentSections: []domain.DocumentSection{
+			{Heading: "Fallback Section", Bullets: []string{"should not be used"}},
+		},
+	}
+
+	doc := runner.CreateDoc(context.Background(), plan, "write a doc", Result{}, "# Agent Doc\n\n## Decision\n\nUse the agent content.")
+	if !doc.Success {
+		t.Fatalf("create doc failed: %s", doc.ErrorMessage)
+	}
+
+	assertFileContains(t, doc.ArtifactPath, "## Decision")
+	assertFileContains(t, doc.ArtifactPath, "Use the agent content.")
+	assertFileNotContains(t, doc.ArtifactPath, "Fallback Section")
+	if got := doc.Data["content_source"]; got != "agent_markdown" {
+		t.Fatalf("expected agent content source, got %q", got)
+	}
+}
+
+func TestCreateSlidesUsesGeneratedMarkdownAndUpdatesNotes(t *testing.T) {
+	t.Parallel()
+
+	runner := NewRunner(Config{ArtifactDir: t.TempDir()})
+	plan := domain.Plan{SlideTitle: "Generated Slides"}
+
+	slides := runner.CreateSlides(context.Background(), plan, "---\ntheme: default\n---\n\n# Agent Slide", "")
+	if !slides.Success {
+		t.Fatalf("create slides failed: %s", slides.ErrorMessage)
+	}
+	assertFileContains(t, slides.ArtifactPath, "# Agent Slide")
+	if got := slides.Data["content_source"]; got != "agent_slidev_markdown" {
+		t.Fatalf("expected agent slide source, got %q", got)
+	}
+
+	notes := runner.CreateSpeakerNotes(context.Background(), plan, "# Notes\n\nSay this.", slides)
+	if !notes.Success {
+		t.Fatalf("create speaker notes failed: %s", notes.ErrorMessage)
+	}
+	assertFileContains(t, notes.ArtifactPath, "Say this.")
+	if got := notes.Data["notes_source"]; got != "agent_speaker_notes" {
+		t.Fatalf("expected agent notes source, got %q", got)
+	}
 }
 
 func assertFileContains(t *testing.T, path, want string) {

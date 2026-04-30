@@ -131,14 +131,19 @@ func (r *Runner) CompleteStep(step domain.PlanStep) Result {
 	}
 }
 
-func (r *Runner) CreateDoc(ctx context.Context, plan domain.Plan, instruction string, contextResult Result) Result {
+func (r *Runner) CreateDoc(ctx context.Context, plan domain.Plan, instruction string, contextResult Result, generatedMarkdown string) Result {
 	if err := os.MkdirAll(r.config.ArtifactDir, 0755); err != nil {
 		return failed("doc.generate", err)
 	}
 
 	fileName := fmt.Sprintf("doc_%s.md", artifactID())
 	path := filepath.Join(r.config.ArtifactDir, fileName)
-	content := renderDocument(plan, instruction, contextResult)
+	content := strings.TrimSpace(generatedMarkdown)
+	contentSource := "agent_markdown"
+	if content == "" {
+		content = renderDocument(plan, instruction, contextResult)
+		contentSource = "planner_fallback"
+	}
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return failed("doc.generate", err)
 	}
@@ -149,7 +154,7 @@ func (r *Runner) CreateDoc(ctx context.Context, plan domain.Plan, instruction st
 		PayloadSummary: fmt.Sprintf("已生成结构化 Markdown 文档：%s", path),
 		ArtifactURL:    "/artifacts/" + fileName,
 		ArtifactPath:   path,
-		Data:           map[string]string{"source": "local_markdown"},
+		Data:           map[string]string{"source": "local_markdown", "content_source": contentSource},
 	}
 
 	if r.config.EnableFeishuTools {
@@ -170,7 +175,7 @@ func (r *Runner) CreateDoc(ctx context.Context, plan domain.Plan, instruction st
 	return result
 }
 
-func (r *Runner) CreateSlides(ctx context.Context, plan domain.Plan) Result {
+func (r *Runner) CreateSlides(ctx context.Context, plan domain.Plan, slidevMarkdown, speakerNotes string) Result {
 	if err := os.MkdirAll(r.config.ArtifactDir, 0755); err != nil {
 		return failed("slide.generate", err)
 	}
@@ -178,14 +183,25 @@ func (r *Runner) CreateSlides(ctx context.Context, plan domain.Plan) Result {
 	slideID := "slide_" + artifactID()
 	fileName := slideID + ".md"
 	path := filepath.Join(r.config.ArtifactDir, fileName)
-	content := renderSlidev(plan)
+	content := strings.TrimSpace(slidevMarkdown)
+	contentSource := "agent_slidev_markdown"
+	if content == "" {
+		content = renderSlidev(plan)
+		contentSource = "planner_fallback"
+	}
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
 		return failed("slide.generate", err)
 	}
 
 	notesName := slideID + "_speaker_notes.md"
 	notesPath := filepath.Join(r.config.ArtifactDir, notesName)
-	if err := os.WriteFile(notesPath, []byte(renderSpeakerNotes(plan)), 0644); err != nil {
+	notesContent := strings.TrimSpace(speakerNotes)
+	notesSource := "agent_speaker_notes"
+	if notesContent == "" {
+		notesContent = renderSpeakerNotes(plan)
+		notesSource = "planner_fallback"
+	}
+	if err := os.WriteFile(notesPath, []byte(notesContent), 0644); err != nil {
 		return failed("slide.rehearse", err)
 	}
 
@@ -196,8 +212,11 @@ func (r *Runner) CreateSlides(ctx context.Context, plan domain.Plan) Result {
 	}
 
 	data := map[string]string{
-		"source":        "slidev_markdown",
-		"speaker_notes": "/artifacts/" + notesName,
+		"source":             "slidev_markdown",
+		"content_source":     contentSource,
+		"speaker_notes":      "/artifacts/" + notesName,
+		"speaker_notes_path": notesPath,
+		"notes_source":       notesSource,
 	}
 	if r.config.EnableFeishuTools {
 		data["feishu_slides"] = "not_created"
@@ -210,6 +229,57 @@ func (r *Runner) CreateSlides(ctx context.Context, plan domain.Plan) Result {
 		ArtifactURL:    "/artifacts/" + fileName,
 		ArtifactPath:   path,
 		Data:           data,
+	}
+}
+
+func (r *Runner) CreateSpeakerNotes(ctx context.Context, plan domain.Plan, speakerNotes string, slidesResult Result) Result {
+	if err := os.MkdirAll(r.config.ArtifactDir, 0755); err != nil {
+		return failed("slide.rehearse", err)
+	}
+
+	notesPath := ""
+	notesURL := ""
+	if slidesResult.Data != nil {
+		notesPath = slidesResult.Data["speaker_notes_path"]
+		notesURL = slidesResult.Data["speaker_notes"]
+	}
+	if notesPath == "" {
+		notesName := "speaker_notes_" + artifactID() + ".md"
+		notesPath = filepath.Join(r.config.ArtifactDir, notesName)
+		notesURL = "/artifacts/" + notesName
+	}
+	if notesURL == "" {
+		notesURL = "/artifacts/" + filepath.Base(notesPath)
+	}
+
+	content := strings.TrimSpace(speakerNotes)
+	contentSource := "agent_speaker_notes"
+	if content == "" {
+		content = renderSpeakerNotes(plan)
+		contentSource = "planner_fallback"
+	}
+	if err := os.WriteFile(notesPath, []byte(content), 0644); err != nil {
+		return failed("slide.rehearse", err)
+	}
+
+	select {
+	case <-ctx.Done():
+		return failed("slide.rehearse", ctx.Err())
+	default:
+	}
+
+	return Result{
+		Success:        true,
+		StepName:       "slide.rehearse",
+		PayloadSummary: fmt.Sprintf("Generated speaker notes: %s", notesPath),
+		ArtifactURL:    slidesResult.ArtifactURL,
+		ArtifactPath:   notesPath,
+		Data: map[string]string{
+			"source":             "speaker_notes",
+			"speaker_notes":      notesURL,
+			"speaker_notes_path": notesPath,
+			"notes_source":       contentSource,
+		},
 	}
 }
 
@@ -717,10 +787,11 @@ func formatMessageTime(ms string) string {
 }
 
 func (r *Runner) documentURL(docID string) string {
-	if r.config.FeishuDocBaseURL == "" {
-		return ""
+	baseURL := r.config.FeishuDocBaseURL
+	if baseURL == "" {
+		baseURL = "https://sample.feishu.cn"
 	}
-	return r.config.FeishuDocBaseURL + "/docx/" + docID
+	return strings.TrimRight(baseURL, "/") + "/docx/" + docID
 }
 
 func failed(step string, err error) Result {

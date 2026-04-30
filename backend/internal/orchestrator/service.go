@@ -283,21 +283,21 @@ func (s *Service) runToolStep(ctx context.Context, task domain.Task, plan domain
 		if *docGenerated {
 			return s.tools.CompleteStep(step)
 		}
-		*docResult = s.tools.CreateDoc(ctx, plan, task.UserInstruction, *contextResult)
+		*docResult = s.tools.CreateDoc(ctx, plan, task.UserInstruction, *contextResult, "")
 		*docGenerated = docResult.Success
 		return *docResult
 	case "slide.generate":
 		if *slidesGenerated {
 			return s.tools.CompleteStep(step)
 		}
-		*slidesResult = s.tools.CreateSlides(ctx, plan)
+		*slidesResult = s.tools.CreateSlides(ctx, plan, "", "")
 		*slidesGenerated = slidesResult.Success
 		return *slidesResult
 	case "slide.rehearse":
 		if *slidesGenerated {
 			return s.tools.CompleteStep(step)
 		}
-		*slidesResult = s.tools.CreateSlides(ctx, plan)
+		*slidesResult = s.tools.CreateSlides(ctx, plan, "", "")
 		*slidesGenerated = slidesResult.Success
 		return *slidesResult
 	case "archive.bundle":

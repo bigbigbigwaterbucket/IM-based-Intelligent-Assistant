@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,10 +50,10 @@ func NewADKExecutorWithSkillDir(runner *tools.Runner, sink ProgressSink, history
 }
 
 func NewADKExecutorFromEnv(ctx context.Context, runner *tools.Runner, sink ProgressSink, history store.HistoryRepository) (*ADKExecutor, bool, error) {
-	if !reactAgentEnabled() {
+	if !agentExecutorEnabled() {
 		return nil, false, nil
 	}
-	config := reactModelConfigFromEnv()
+	config := agentModelConfigFromEnv()
 	if !config.enabled() {
 		return nil, true, errors.New("eino adk agent is enabled but no model config is available")
 	}
@@ -113,7 +114,8 @@ func (e *ADKExecutor) Execute(ctx context.Context, task domain.Task, plan domain
 
 	planJSON, _ := json.MarshalIndent(plan, "", "  ")
 	iter := agent.Run(ctx, &adk.AgentInput{Messages: []adk.Message{
-		schema.UserMessage(fmt.Sprintf("Task ID: %s\nTitle: %s\nInstruction: %s\nPlan JSON:\n%s\n\nExecute the plan now. Follow dependency order. For document generation, load and follow the document_generation skill before calling doc tools. For slide/PPT generation, load and follow the slide_generation skill before calling slide tools. Call every required plan tool exactly once using the safe tool names described in the system message. Do not invent artifacts.", task.TaskID, task.Title, task.UserInstruction, string(planJSON))),
+		schema.UserMessage(fmt.Sprintf("Task ID: %s\nTitle: %s\nInstruction: %s\nPlan JSON:\n%s\n\nExecute the plan now. Follow dependency order. For document generation, load and follow the document_generation skill before calling doc tools. For slide/PPT generation, load and follow the slide_generation skill before calling slide tools. Call every required plan tool exactly once using the safe tool names described in the system message. Do not invent artifacts.",
+			task.TaskID, task.Title, task.UserInstruction, string(planJSON))),
 	}})
 
 	finalTexts := make([]string, 0)
@@ -201,8 +203,92 @@ Rules:
 3. Before any doc tool, call skill with skill=document_generation and follow the returned instructions.
 4. Before any slide or PPT tool, call skill with skill=slide_generation and follow the returned instructions.
 5. Pass stepId, original dotted tool name, and description in plan tool arguments.
-6. Do not call artifact tools for greeting or status-only tasks.
-7. After tool calls complete, summarize what was produced.`
+6. For doc_create/doc_append/doc_generate, generate the final user-facing Markdown yourself and pass it as content.
+7. For slide_generate, generate the final Slidev Markdown yourself and pass it as slidevMarkdown. For slide_rehearse, generate speaker notes and pass them as speakerNotes.
+8. Do not call artifact tools for greeting or status-only tasks.
+9. After tool calls complete, summarize what was produced.`
+}
+
+type agentModelConfig struct {
+	APIKey     string
+	BaseURL    string
+	Model      string
+	Timeout    time.Duration
+	HTTPClient *http.Client
+}
+
+func (c agentModelConfig) enabled() bool {
+	return c.APIKey != "" && c.BaseURL != "" && c.Model != ""
+}
+
+func (c agentModelConfig) chatModelConfig() *openai.ChatModelConfig {
+	temperature := float32(0.2)
+	maxTokens := 4096
+	return &openai.ChatModelConfig{
+		APIKey:      c.APIKey,
+		BaseURL:     c.BaseURL,
+		Model:       c.Model,
+		Timeout:     c.Timeout,
+		HTTPClient:  c.HTTPClient,
+		Temperature: &temperature,
+		MaxTokens:   &maxTokens,
+	}
+}
+
+func agentModelConfigFromEnv() agentModelConfig {
+	apiKey := strings.TrimSpace(os.Getenv("AGENT_API_KEY"))
+	baseURL := strings.TrimSpace(os.Getenv("AGENT_BASE_URL"))
+	model := strings.TrimSpace(os.Getenv("AGENT_MODEL"))
+	if apiKey != "" || baseURL != "" || model != "" {
+		return agentModelConfig{
+			APIKey:  apiKey,
+			BaseURL: strings.TrimRight(baseURL, "/"),
+			Model:   model,
+			Timeout: 60 * time.Second,
+		}
+	}
+
+	apiKey = strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY"))
+	baseURL = strings.TrimSpace(os.Getenv("DEEPSEEK_BASE_URL"))
+	model = strings.TrimSpace(os.Getenv("DEEPSEEK_MODEL"))
+	if apiKey != "" && baseURL != "" && model != "" {
+		return agentModelConfig{
+			APIKey:  apiKey,
+			BaseURL: strings.TrimRight(baseURL, "/"),
+			Model:   model,
+			Timeout: 60 * time.Second,
+		}
+	}
+
+	baseURL = strings.TrimSpace(os.Getenv("DEEPSEEK_BASE_URL"))
+	if baseURL == "" {
+		baseURL = "https://api.deepseek.com"
+	}
+	model = strings.TrimSpace(os.Getenv("DEEPSEEK_MODEL"))
+	if model == "" {
+		model = "deepseek-chat"
+	}
+	return agentModelConfig{
+		APIKey:  strings.TrimSpace(os.Getenv("DEEPSEEK_API_KEY")),
+		BaseURL: strings.TrimRight(baseURL, "/"),
+		Model:   model,
+		Timeout: 60 * time.Second,
+	}
+}
+
+func agentExecutorEnabled() bool {
+	value := strings.TrimSpace(os.Getenv("AGENT_EXECUTOR"))
+	return strings.EqualFold(value, "adk") ||
+		strings.EqualFold(value, "eino-adk") ||
+		strings.EqualFold(value, "react") ||
+		strings.EqualFold(value, "eino-react") ||
+		envBool("ENABLE_ADK_AGENT") ||
+		envBool("ENABLE_REACT_AGENT")
+}
+
+func envBool(key string) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	return value == "1" || strings.EqualFold(value, "true")
 }
 
 func generationSkillMiddleware(ctx context.Context, skillDir string) (adk.ChatModelAgentMiddleware, error) {

@@ -138,6 +138,35 @@ func (e *PlanExecutor) appendMessage(ctx context.Context, sessionID, role, conte
 	})
 }
 
+func ensureSession(ctx context.Context, history store.HistoryRepository, sessionID string, task domain.Task) error {
+	if history == nil {
+		return nil
+	}
+	now := time.Now()
+	return history.UpsertSession(ctx, domain.Session{
+		SessionID: sessionID,
+		TaskID:    task.TaskID,
+		ChatID:    task.ChatID,
+		ThreadID:  task.ThreadID,
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+}
+
+func appendMessage(ctx context.Context, history store.HistoryRepository, sessionID, role, content, metadata string) error {
+	if history == nil || strings.TrimSpace(content) == "" {
+		return nil
+	}
+	return history.AppendMessage(ctx, domain.ConversationMessage{
+		MessageID: uuid.NewString(),
+		SessionID: sessionID,
+		Role:      role,
+		Content:   content,
+		Metadata:  metadata,
+		CreatedAt: time.Now(),
+	})
+}
+
 type toolSet struct {
 	byPlanName map[string]tool.InvokableTool
 	tools      []tool.BaseTool
@@ -146,7 +175,7 @@ type toolSet struct {
 func newToolSet(runner *tools.Runner, sink ProgressSink, history store.HistoryRepository, sessionID string, task domain.Task, plan domain.Plan, state *executionState) toolSet {
 	wrap := func(planName, displayName, description string) tool.InvokableTool {
 		return &executionTool{
-			info:        toolInfo(safeToolName(planName), description),
+			info:        toolInfo(safeToolName(planName), description, planName),
 			planName:    planName,
 			displayName: displayName,
 			runner:      runner,
@@ -227,7 +256,7 @@ func (t *executionTool) InvokableRun(ctx context.Context, argumentsInJSON string
 		return "", err
 	}
 
-	result := t.execute(ctx, step)
+	result := t.execute(ctx, step, input)
 	completedAt := time.Now()
 	logToolResult(t.task.TaskID, step, argumentsInJSON, result, completedAt.Sub(startedAt))
 	if t.history != nil {
@@ -250,7 +279,7 @@ func (t *executionTool) InvokableRun(ctx context.Context, argumentsInJSON string
 	return string(payload), nil
 }
 
-func (t *executionTool) execute(ctx context.Context, step domain.PlanStep) tools.Result {
+func (t *executionTool) execute(ctx context.Context, step domain.PlanStep, input stepToolInput) tools.Result {
 	switch step.Tool {
 	case "im.fetch_thread", "im.context_summarize":
 		t.state.contextResult = t.runner.FetchThread(ctx, t.task, step)
@@ -259,16 +288,27 @@ func (t *executionTool) execute(ctx context.Context, step domain.PlanStep) tools
 		if t.state.docGenerated {
 			return t.runner.CompleteStep(step)
 		}
-		t.state.docResult = t.runner.CreateDoc(ctx, t.plan, t.task.UserInstruction, t.state.contextResult)
+		t.state.docResult = t.runner.CreateDoc(ctx, t.plan, t.task.UserInstruction, t.state.contextResult, input.documentContent())
 		t.state.docGenerated = t.state.docResult.Success
 		return t.state.docResult
-	case "slide.generate", "slide.rehearse":
+	case "slide.generate":
 		if t.state.slidesGenerated {
 			return t.runner.CompleteStep(step)
 		}
-		t.state.slidesResult = t.runner.CreateSlides(ctx, t.plan)
+		t.state.slidesResult = t.runner.CreateSlides(ctx, t.plan, input.slidevContent(), input.speakerNotesContent())
 		t.state.slidesGenerated = t.state.slidesResult.Success
 		return t.state.slidesResult
+	case "slide.rehearse":
+		if !t.state.slidesGenerated {
+			t.state.slidesResult = t.runner.CreateSlides(ctx, t.plan, input.slidevContent(), input.speakerNotesContent())
+			t.state.slidesGenerated = t.state.slidesResult.Success
+			return t.state.slidesResult
+		}
+		result := t.runner.CreateSpeakerNotes(ctx, t.plan, input.speakerNotesContent(), t.state.slidesResult)
+		if result.Success {
+			t.mergeSlideResultData(result)
+		}
+		return result
 	case "archive.bundle":
 		return t.runner.Bundle(ctx, t.task, t.plan, t.state.docResult, t.state.slidesResult)
 	case "sync.broadcast":
@@ -278,11 +318,68 @@ func (t *executionTool) execute(ctx context.Context, step domain.PlanStep) tools
 	}
 }
 
+func (t *executionTool) mergeSlideResultData(result tools.Result) {
+	if t.state.slidesResult.Data == nil {
+		t.state.slidesResult.Data = map[string]string{}
+	}
+	for key, value := range result.Data {
+		t.state.slidesResult.Data[key] = value
+	}
+	if result.ArtifactURL != "" {
+		t.state.slidesResult.ArtifactURL = result.ArtifactURL
+	}
+}
+
 type stepToolInput struct {
-	StepID      string         `json:"stepId"`
-	Tool        string         `json:"tool"`
-	Description string         `json:"description"`
-	Args        map[string]any `json:"args,omitempty"`
+	StepID         string         `json:"stepId"`
+	Tool           string         `json:"tool"`
+	Description    string         `json:"description"`
+	Content        string         `json:"content,omitempty"`
+	Markdown       string         `json:"markdown,omitempty"`
+	SlidevMarkdown string         `json:"slidevMarkdown,omitempty"`
+	SpeakerNotes   string         `json:"speakerNotes,omitempty"`
+	Args           map[string]any `json:"args,omitempty"`
+}
+
+func (i stepToolInput) documentContent() string {
+	if strings.TrimSpace(i.Content) != "" {
+		return i.Content
+	}
+	if strings.TrimSpace(i.Markdown) != "" {
+		return i.Markdown
+	}
+	return stringArg(i.Args, "content", "markdown", "documentMarkdown", "document")
+}
+
+func (i stepToolInput) slidevContent() string {
+	if strings.TrimSpace(i.SlidevMarkdown) != "" {
+		return i.SlidevMarkdown
+	}
+	if strings.TrimSpace(i.Content) != "" {
+		return i.Content
+	}
+	if strings.TrimSpace(i.Markdown) != "" {
+		return i.Markdown
+	}
+	return stringArg(i.Args, "slidevMarkdown", "content", "markdown", "slides")
+}
+
+func (i stepToolInput) speakerNotesContent() string {
+	if strings.TrimSpace(i.SpeakerNotes) != "" {
+		return i.SpeakerNotes
+	}
+	return stringArg(i.Args, "speakerNotes", "notes")
+}
+
+func stringArg(args map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := args[key]; ok {
+			if text, ok := value.(string); ok && strings.TrimSpace(text) != "" {
+				return text
+			}
+		}
+	}
+	return ""
 }
 
 func toolInvocation(sessionID, taskID string, step domain.PlanStep, args string, result tools.Result, startedAt, completedAt time.Time) domain.ToolInvocation {
@@ -374,27 +471,55 @@ func safeToolName(name string) string {
 	return name
 }
 
-func toolInfo(name, description string) *schema.ToolInfo {
+func toolInfo(name, description, planName string) *schema.ToolInfo {
+	params := map[string]*schema.ParameterInfo{
+		"stepId": {
+			Type:     schema.String,
+			Desc:     "Plan step ID.",
+			Required: true,
+		},
+		"tool": {
+			Type:     schema.String,
+			Desc:     "Original plan tool name.",
+			Required: true,
+		},
+		"description": {
+			Type:     schema.String,
+			Desc:     "Human-readable step description.",
+			Required: true,
+		},
+	}
+
+	switch planName {
+	case "doc.create", "doc.append", "doc.generate":
+		params["content"] = &schema.ParameterInfo{
+			Type:     schema.String,
+			Desc:     "Complete Markdown document content to persist. Generate this from the task instruction, plan, and fetched IM context; do not leave it empty.",
+			Required: true,
+		}
+	case "slide.generate":
+		params["slidevMarkdown"] = &schema.ParameterInfo{
+			Type:     schema.String,
+			Desc:     "Complete Slidev Markdown presentation content to persist. Include frontmatter and all slides.",
+			Required: true,
+		}
+		params["speakerNotes"] = &schema.ParameterInfo{
+			Type:     schema.String,
+			Desc:     "Optional speaker notes Markdown. If omitted, call slide_rehearse later with complete notes.",
+			Required: false,
+		}
+	case "slide.rehearse":
+		params["speakerNotes"] = &schema.ParameterInfo{
+			Type:     schema.String,
+			Desc:     "Complete speaker notes Markdown for the generated presentation.",
+			Required: true,
+		}
+	}
+
 	return &schema.ToolInfo{
-		Name: name,
-		Desc: description,
-		ParamsOneOf: schema.NewParamsOneOfByParams(map[string]*schema.ParameterInfo{
-			"stepId": {
-				Type:     schema.String,
-				Desc:     "Plan step ID.",
-				Required: true,
-			},
-			"tool": {
-				Type:     schema.String,
-				Desc:     "Original plan tool name.",
-				Required: true,
-			},
-			"description": {
-				Type:     schema.String,
-				Desc:     "Human-readable step description.",
-				Required: true,
-			},
-		}),
+		Name:        name,
+		Desc:        description,
+		ParamsOneOf: schema.NewParamsOneOfByParams(params),
 	}
 }
 
