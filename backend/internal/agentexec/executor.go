@@ -414,8 +414,8 @@ func logToolResult(taskID string, step domain.PlanStep, args string, result tool
 		step.ID,
 		step.Tool,
 		duration.Round(time.Millisecond),
-		limitLogText(args, 12000),
-		limitLogText(string(resultJSON), 12000),
+		limitLogText(args, 120),
+		limitLogText(string(resultJSON), 120),
 	)
 }
 

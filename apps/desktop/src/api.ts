@@ -1,23 +1,14 @@
 import type {
+  ConnectionStatus,
   EventEnvelope,
   Task,
   TaskActionRequest,
   TaskCreateRequest,
 } from "@agent-pilot/shared";
+import { normalizeTask, normalizeTasks } from "@agent-pilot/shared";
 
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8080";
 const WS_BASE = (import.meta.env.VITE_WS_BASE ?? "ws://localhost:8080") + "/ws";
-
-function normalizeTask(task: unknown): Task | null {
-  if (!task || typeof task !== "object") {
-    return null;
-  }
-  const candidate = task as Task;
-  return {
-    ...candidate,
-    steps: Array.isArray(candidate.steps) ? candidate.steps : [],
-  };
-}
 
 export async function listTasks(): Promise<Task[]> {
   const response = await fetch(`${API_BASE}/tasks`);
@@ -25,7 +16,7 @@ export async function listTasks(): Promise<Task[]> {
     throw new Error("Failed to load tasks");
   }
   const data = (await response.json()) as unknown;
-  return Array.isArray(data) ? data.map(normalizeTask).filter((task): task is Task => task !== null) : [];
+  return normalizeTasks(data);
 }
 
 export async function createTask(payload: TaskCreateRequest): Promise<Task> {
@@ -64,20 +55,81 @@ export async function sendTaskAction(taskId: string, payload: TaskActionRequest)
   return task;
 }
 
-export function connectEvents(onEvent: (event: EventEnvelope<Task>) => void): () => void {
-  const socket = new WebSocket(WS_BASE);
-  socket.onmessage = (message) => {
-    const event = JSON.parse(message.data) as EventEnvelope<unknown>;
-    const payload = normalizeTask(event?.payload);
-    if (!payload) {
+export function connectEvents(
+  onEvent: (event: EventEnvelope<Task>) => void,
+  onStatus: (status: ConnectionStatus) => void,
+  onReconnect?: () => void,
+): () => void {
+  let socket: WebSocket | undefined;
+  let retryTimer: number | undefined;
+  let closed = false;
+  let attempts = 0;
+
+  function connect() {
+    if (closed) {
       return;
     }
-    onEvent({
-      ...event,
-      payload,
-    });
-  };
+    if (typeof navigator !== "undefined" && !navigator.onLine) {
+      onStatus("offline");
+      return;
+    }
+
+    onStatus(attempts === 0 ? "connecting" : "reconnecting");
+    socket = new WebSocket(WS_BASE);
+
+    socket.onopen = () => {
+      attempts = 0;
+      onStatus("online");
+      onReconnect?.();
+    };
+
+    socket.onmessage = (message) => {
+      const event = JSON.parse(message.data) as EventEnvelope<unknown>;
+      const payload = normalizeTask(event?.payload);
+      if (!payload) {
+        return;
+      }
+      onEvent({
+        ...event,
+        payload,
+      });
+    };
+
+    socket.onclose = () => {
+      if (closed) {
+        return;
+      }
+      attempts += 1;
+      onStatus(typeof navigator !== "undefined" && !navigator.onLine ? "offline" : "reconnecting");
+      retryTimer = window.setTimeout(connect, Math.min(8000, 1000 * attempts));
+    };
+
+    socket.onerror = () => {
+      socket?.close();
+    };
+  }
+
+  function handleOffline() {
+    onStatus("offline");
+    socket?.close();
+  }
+
+  function handleOnline() {
+    attempts = 0;
+    connect();
+  }
+
+  window.addEventListener("offline", handleOffline);
+  window.addEventListener("online", handleOnline);
+  connect();
+
   return () => {
-    socket.close();
+    closed = true;
+    if (retryTimer) {
+      window.clearTimeout(retryTimer);
+    }
+    window.removeEventListener("offline", handleOffline);
+    window.removeEventListener("online", handleOnline);
+    socket?.close();
   };
 }

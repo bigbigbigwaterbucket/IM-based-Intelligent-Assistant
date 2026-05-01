@@ -113,6 +113,7 @@ func (e *ADKExecutor) Execute(ctx context.Context, task domain.Task, plan domain
 	}
 
 	planJSON, _ := json.MarshalIndent(plan, "", "  ")
+	log.Println(plan)
 	iter := agent.Run(ctx, &adk.AgentInput{Messages: []adk.Message{
 		schema.UserMessage(fmt.Sprintf("Task ID: %s\nTitle: %s\nInstruction: %s\nPlan JSON:\n%s\n\nExecute the plan now. Follow dependency order. For document generation, load and follow the document_generation skill before calling doc tools. For slide/PPT generation, load and follow the slide_generation skill before calling slide tools. Call every required plan tool exactly once using the safe tool names described in the system message. Do not invent artifacts.",
 			task.TaskID, task.Title, task.UserInstruction, string(planJSON))),
@@ -177,7 +178,7 @@ func skillToolLogMiddleware() compose.ToolMiddleware {
 					log.Printf("[agent-tool] tool=skill duration=%s args=%s error=%s", duration.Round(time.Millisecond), limitLogText(input.Arguments, 12000), err.Error())
 					return output, err
 				}
-				log.Printf("[agent-tool] tool=skill duration=%s args=%s result=%s", duration.Round(time.Millisecond), limitLogText(input.Arguments, 12000), limitLogText(result, 12000))
+				log.Printf("[agent-tool] tool=skill duration=%s args=%s result=%s", duration.Round(time.Millisecond), limitLogText(input.Arguments, 12000), limitLogText(result, 120))
 				return output, nil
 			}
 		},
