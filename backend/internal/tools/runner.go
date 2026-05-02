@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/CoolBanHub/genppt"
 	"github.com/google/uuid"
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkdocx "github.com/larksuite/oapi-sdk-go/v3/service/docx/v1"
@@ -176,34 +177,27 @@ func (r *Runner) CreateDoc(ctx context.Context, plan domain.Plan, instruction st
 	return result
 }
 
-func (r *Runner) CreateSlides(ctx context.Context, plan domain.Plan, slidevMarkdown, speakerNotes string) Result {
+func (r *Runner) CreateSlides(ctx context.Context, plan domain.Plan, slideMarkdown string) Result {
 	if err := os.MkdirAll(r.config.ArtifactDir, 0755); err != nil {
 		return failed("slide.generate", err)
 	}
 
 	slideID := "slide_" + artifactID()
-	fileName := slideID + ".md"
-	path := filepath.Join(r.config.ArtifactDir, fileName)
-	content := strings.TrimSpace(slidevMarkdown)
-	contentSource := "agent_slidev_markdown"
+	markdownName := slideID + ".md"
+	markdownPath := filepath.Join(r.config.ArtifactDir, markdownName)
+	pptxName := slideID + ".pptx"
+	pptxPath := filepath.Join(r.config.ArtifactDir, pptxName)
+	content := strings.TrimSpace(slideMarkdown)
+	contentSource := "agent_markdown"
 	if content == "" {
-		content = renderSlidev(plan)
+		content = renderSlideMarkdown(plan)
 		contentSource = "planner_fallback"
 	}
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+	if err := os.WriteFile(markdownPath, []byte(content), 0644); err != nil {
 		return failed("slide.generate", err)
 	}
-
-	notesName := slideID + "_speaker_notes.md"
-	notesPath := filepath.Join(r.config.ArtifactDir, notesName)
-	notesContent := strings.TrimSpace(speakerNotes)
-	notesSource := "agent_speaker_notes"
-	if notesContent == "" {
-		notesContent = renderSpeakerNotes(plan)
-		notesSource = "planner_fallback"
-	}
-	if err := os.WriteFile(notesPath, []byte(notesContent), 0644); err != nil {
-		return failed("slide.rehearse", err)
+	if err := writePPTXFromMarkdown(content, pptxPath); err != nil {
+		return failed("slide.generate", err)
 	}
 
 	select {
@@ -213,11 +207,13 @@ func (r *Runner) CreateSlides(ctx context.Context, plan domain.Plan, slidevMarkd
 	}
 
 	data := map[string]string{
-		"source":             "slidev_markdown",
+		"source":             "genppt_pptx",
 		"content_source":     contentSource,
-		"speaker_notes":      "/artifacts/" + notesName,
-		"speaker_notes_path": notesPath,
-		"notes_source":       notesSource,
+		"markdown_artifact":  "/artifacts/" + markdownName,
+		"markdown_path":      markdownPath,
+		"pptx_artifact":      "/artifacts/" + pptxName,
+		"pptx_path":          pptxPath,
+		"conversion_library": "github.com/CoolBanHub/genppt",
 	}
 	if r.config.EnableFeishuTools {
 		data["feishu_slides"] = "not_created"
@@ -226,9 +222,9 @@ func (r *Runner) CreateSlides(ctx context.Context, plan domain.Plan, slidevMarkd
 	return Result{
 		Success:        true,
 		StepName:       "slide.generate",
-		PayloadSummary: fmt.Sprintf("已生成 Slidev 演示稿：%s", path),
-		ArtifactURL:    "/artifacts/" + fileName,
-		ArtifactPath:   path,
+		PayloadSummary: fmt.Sprintf("已通过 genppt 生成 PPTX：%s", pptxPath),
+		ArtifactURL:    "/artifacts/" + pptxName,
+		ArtifactPath:   markdownPath,
 		Data:           data,
 	}
 }
@@ -300,67 +296,16 @@ func (r *Runner) UpdateDoc(ctx context.Context, task domain.Task, plan domain.Pl
 	return result
 }
 
-func (r *Runner) RegenerateSlides(ctx context.Context, task domain.Task, plan domain.Plan, slidevMarkdown, speakerNotes string) Result {
-	if strings.TrimSpace(slidevMarkdown) == "" {
-		slidevMarkdown = appendRevisionToExisting(task.SlidesArtifactPath, plan.Summary)
+func (r *Runner) RegenerateSlides(ctx context.Context, task domain.Task, plan domain.Plan, slideMarkdown string) Result {
+	if strings.TrimSpace(slideMarkdown) == "" {
+		slideMarkdown = appendRevisionToExisting(task.SlidesArtifactPath, plan.Summary)
 	}
-	result := r.CreateSlides(ctx, plan, slidevMarkdown, speakerNotes)
+	result := r.CreateSlides(ctx, plan, slideMarkdown)
 	result.StepName = "slide.regenerate"
 	if result.Success {
-		result.PayloadSummary = "Regenerated Slidev presentation: " + result.ArtifactPath
+		result.PayloadSummary = "Regenerated PPTX presentation: " + result.Data["pptx_path"]
 	}
 	return result
-}
-
-func (r *Runner) CreateSpeakerNotes(ctx context.Context, plan domain.Plan, speakerNotes string, slidesResult Result) Result {
-	if err := os.MkdirAll(r.config.ArtifactDir, 0755); err != nil {
-		return failed("slide.rehearse", err)
-	}
-
-	notesPath := ""
-	notesURL := ""
-	if slidesResult.Data != nil {
-		notesPath = slidesResult.Data["speaker_notes_path"]
-		notesURL = slidesResult.Data["speaker_notes"]
-	}
-	if notesPath == "" {
-		notesName := "speaker_notes_" + artifactID() + ".md"
-		notesPath = filepath.Join(r.config.ArtifactDir, notesName)
-		notesURL = "/artifacts/" + notesName
-	}
-	if notesURL == "" {
-		notesURL = "/artifacts/" + filepath.Base(notesPath)
-	}
-
-	content := strings.TrimSpace(speakerNotes)
-	contentSource := "agent_speaker_notes"
-	if content == "" {
-		content = renderSpeakerNotes(plan)
-		contentSource = "planner_fallback"
-	}
-	if err := os.WriteFile(notesPath, []byte(content), 0644); err != nil {
-		return failed("slide.rehearse", err)
-	}
-
-	select {
-	case <-ctx.Done():
-		return failed("slide.rehearse", ctx.Err())
-	default:
-	}
-
-	return Result{
-		Success:        true,
-		StepName:       "slide.rehearse",
-		PayloadSummary: fmt.Sprintf("Generated speaker notes: %s", notesPath),
-		ArtifactURL:    slidesResult.ArtifactURL,
-		ArtifactPath:   notesPath,
-		Data: map[string]string{
-			"source":             "speaker_notes",
-			"speaker_notes":      notesURL,
-			"speaker_notes_path": notesPath,
-			"notes_source":       contentSource,
-		},
-	}
 }
 
 func (r *Runner) Bundle(ctx context.Context, task domain.Task, plan domain.Plan, docResult, slidesResult Result) Result {
@@ -386,7 +331,7 @@ func (r *Runner) Bundle(ctx context.Context, task domain.Task, plan domain.Plan,
 		"docPath":        docResult.ArtifactPath,
 		"slidesUrl":      slidesResult.ArtifactURL,
 		"slidesPath":     slidesResult.ArtifactPath,
-		"speakerNotes":   slidesResult.Data["speaker_notes"],
+		"slidesPptxPath": slidesResult.Data["pptx_path"],
 		"planSteps":      plan.Steps,
 		"intentAnalysis": plan.Analysis,
 	}
@@ -876,40 +821,43 @@ func truncateText(text string, maxRunes int) string {
 	return string(runes[:maxRunes]) + "..."
 }
 
-func renderSlidev(plan domain.Plan) string {
+func renderSlideMarkdown(plan domain.Plan) string {
 	var b strings.Builder
-	b.WriteString("---\n")
-	b.WriteString("theme: seriph\n")
-	b.WriteString("title: " + escapeYAML(fallbackText(plan.SlideTitle, "任务演示稿")) + "\n")
-	b.WriteString("class: text-center\n")
-	b.WriteString("---\n\n")
 	b.WriteString("# " + fallbackText(plan.SlideTitle, "任务演示稿") + "\n\n")
 	b.WriteString(plan.Summary + "\n\n")
 
 	for _, slide := range plan.Slides {
-		b.WriteString("---\n\n")
 		b.WriteString("# " + slide.Title + "\n\n")
 		for _, bullet := range slide.Bullets {
 			b.WriteString("- " + bullet + "\n")
 		}
 		b.WriteString("\n")
-		if slide.SpeakerNote != "" {
-			b.WriteString("<!--\n" + slide.SpeakerNote + "\n-->\n\n")
-		}
 	}
 	return b.String()
 }
 
-func renderSpeakerNotes(plan domain.Plan) string {
-	var b strings.Builder
-	b.WriteString("# " + fallbackText(plan.SlideTitle, "任务演示稿") + " - 演讲稿\n\n")
-	for i, slide := range plan.Slides {
-		b.WriteString(fmt.Sprintf("## 第 %d 页：%s\n\n", i+1, slide.Title))
-		if slide.SpeakerNote != "" {
-			b.WriteString(slide.SpeakerNote + "\n\n")
+func writePPTXFromMarkdown(markdown, path string) error {
+	opts := genppt.DefaultMarkdownOptions()
+	opts.TitleFontSize = 40
+	opts.HeadingFontSize = 30
+	opts.BodyFontSize = 18
+	opts.TitleColor = "#1E3A5F"
+	opts.HeadingColor = "#1E3A5F"
+	opts.BodyColor = "#333333"
+	pres := genppt.FromMarkdownWithOptions(markdown, opts)
+	pres.SetTitle(firstMarkdownTitle(markdown))
+	pres.SetAuthor("IM-based Intelligent Assistant")
+	return pres.WriteFile(path)
+}
+
+func firstMarkdownTitle(markdown string) string {
+	for _, line := range strings.Split(markdown, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "# ") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "# "))
 		}
 	}
-	return b.String()
+	return "任务演示稿"
 }
 
 func normalizeMessages(data *larkim.ListMessageRespData, threadID string) []string {
@@ -1057,10 +1005,6 @@ func failed(step string, err error) Result {
 
 func artifactID() string {
 	return fmt.Sprintf("%d_%s", time.Now().Unix(), uuid.NewString()[:8])
-}
-
-func escapeYAML(value string) string {
-	return strings.ReplaceAll(value, ":", "：")
 }
 
 func fallbackText(value, defaultValue string) string {

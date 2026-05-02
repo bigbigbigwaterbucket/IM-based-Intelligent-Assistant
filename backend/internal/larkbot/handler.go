@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -155,6 +157,9 @@ func (h *Handler) notifyWhenDone(messageID, taskID string) {
 		return
 	}
 	_ = h.messenger.ReplyText(context.Background(), messageID, h.doneText(task))
+	if pptxPath := localSlidesPPTXPath(task); pptxPath != "" {
+		_ = h.messenger.ReplyFile(context.Background(), messageID, pptxPath)
+	}
 }
 
 func (h *Handler) startedText(task domain.Task) string {
@@ -202,7 +207,11 @@ func (h *Handler) doneText(task domain.Task) string {
 		lines = append(lines, "文档："+h.publicLink(task.DocURL))
 	}
 	if task.SlidesURL != "" {
-		lines = append(lines, "幻灯片："+h.publicLink(task.SlidesURL))
+		if localSlidesPPTXPath(task) != "" {
+			lines = append(lines, "幻灯片：见下方 PPT 文件")
+		} else {
+			lines = append(lines, "幻灯片："+h.publicLink(task.SlidesURL))
+		}
 	}
 	return strings.Join(lines, "\n")
 }
@@ -331,6 +340,35 @@ func stringValue(value *string) string {
 		return ""
 	}
 	return *value
+}
+
+func localSlidesPPTXPath(task domain.Task) string {
+	path := strings.TrimSpace(task.SlidesArtifactPath)
+	if path == "" {
+		return ""
+	}
+	if isUsableLocalFile(path) && strings.EqualFold(filepath.Ext(path), ".pptx") {
+		return path
+	}
+
+	candidates := make([]string, 0, 2)
+	if strings.EqualFold(filepath.Ext(path), ".md") {
+		candidates = append(candidates, strings.TrimSuffix(path, filepath.Ext(path))+".pptx")
+	}
+	if strings.HasPrefix(task.SlidesURL, "/artifacts/") {
+		candidates = append(candidates, filepath.Join(filepath.Dir(path), filepath.Base(task.SlidesURL)))
+	}
+	for _, candidate := range candidates {
+		if isUsableLocalFile(candidate) {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func isUsableLocalFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && !info.IsDir() && info.Size() > 0
 }
 
 var errMissingDependency = errors.New("missing larkbot dependency")

@@ -3,6 +3,7 @@ module agentpilot/backend
 go 1.26
 
 require (
+	github.com/CoolBanHub/genppt v0.0.0-20260101075009-61df96324be9
 	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/cloudwego/eino v0.8.10
 	github.com/cloudwego/eino-ext/components/model/openai v0.1.4
@@ -51,6 +52,7 @@ require (
 	github.com/yargevad/filepathx v1.0.0 // indirect
 	golang.org/x/arch v0.11.0 // indirect
 	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
+	golang.org/x/net v0.41.0 // indirect
 	golang.org/x/sys v0.34.0 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

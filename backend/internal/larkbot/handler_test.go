@@ -3,6 +3,8 @@ package larkbot
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -57,6 +59,47 @@ func TestHandleMessageStartsP2PTaskAndRepliesDone(t *testing.T) {
 	}
 	if !strings.Contains(replies, "Assistant任务待审核：task-1") {
 		t.Fatalf("expected review reply: %s", replies)
+	}
+}
+
+func TestNotifyWhenDoneSendsLocalSlidesAsPPTFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	mdPath := filepath.Join(dir, "slide_test.md")
+	pptxPath := filepath.Join(dir, "slide_test.pptx")
+	if err := os.WriteFile(mdPath, []byte("# Slides"), 0644); err != nil {
+		t.Fatalf("write md: %v", err)
+	}
+	if err := os.WriteFile(pptxPath, []byte("pptx"), 0644); err != nil {
+		t.Fatalf("write pptx: %v", err)
+	}
+
+	launcher := &fakeLauncher{
+		doneTask: domain.Task{
+			TaskID:             "task-ppt",
+			Status:             domain.StatusWaitingAction,
+			SlidesURL:          "/artifacts/slide_test.pptx",
+			SlidesArtifactPath: mdPath,
+		},
+	}
+	messenger := &fakeMessenger{}
+	handler := NewHandler(launcher, messenger, "")
+	handler.doneTimeout = time.Second
+	handler.doneInterval = time.Millisecond
+
+	handler.notifyWhenDone("om_test", "task-ppt")
+
+	replies := strings.Join(messenger.replies(), "\n")
+	if strings.Contains(replies, "/artifacts/slide_test.pptx") {
+		t.Fatalf("did not expect local artifact link in text reply: %s", replies)
+	}
+	if !strings.Contains(replies, "幻灯片：见下方 PPT 文件") {
+		t.Fatalf("expected PPT file hint in text reply: %s", replies)
+	}
+	files := messenger.files()
+	if len(files) != 1 || files[0] != pptxPath {
+		t.Fatalf("expected PPT file reply %q, got %#v", pptxPath, files)
 	}
 }
 
@@ -225,12 +268,20 @@ func (f *fakeLauncher) WaitTaskDone(_ context.Context, _ string, _, _ time.Durat
 type fakeMessenger struct {
 	mu       sync.Mutex
 	messages []string
+	fileList []string
 }
 
 func (f *fakeMessenger) ReplyText(_ context.Context, _ string, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.messages = append(f.messages, text)
+	return nil
+}
+
+func (f *fakeMessenger) ReplyFile(_ context.Context, _ string, filePath string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fileList = append(f.fileList, filePath)
 	return nil
 }
 
@@ -253,6 +304,14 @@ func (f *fakeMessenger) replies() []string {
 	defer f.mu.Unlock()
 	out := make([]string, len(f.messages))
 	copy(out, f.messages)
+	return out
+}
+
+func (f *fakeMessenger) files() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.fileList))
+	copy(out, f.fileList)
 	return out
 }
 

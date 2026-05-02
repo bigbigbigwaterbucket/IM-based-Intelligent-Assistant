@@ -116,8 +116,8 @@ func (e *ADKExecutor) Execute(ctx context.Context, task domain.Task, plan domain
 	planJSON, _ := json.MarshalIndent(plan, "", "  ")
 	log.Println("plan: ", plan)
 	iter := agent.Run(ctx, &adk.AgentInput{Messages: []adk.Message{
-		schema.UserMessage(fmt.Sprintf("Task ID: %s\nTitle: %s\nInstruction: %s\nPlan JSON:\n%s\n\nExisting artifact context:\n%s\n\nExecute the plan now. Follow dependency order. For document generation, load and follow the document_generation skill before calling doc tools. For slide/PPT generation, load and follow the slide_generation skill before calling slide tools. For doc_update and slide_regenerate, use the existing artifact context as the baseline and apply the user's latest revision request; do not regenerate from scratch unless the user explicitly asks. Call every required plan tool exactly once using the safe tool names described in the system message. Do not invent artifacts.",
-			task.TaskID, task.Title, task.UserInstruction, string(planJSON), artifactContext.PromptText())),
+		schema.SystemMessage(adkExecutionPrompt(task, string(planJSON))),
+		schema.UserMessage(fmt.Sprintf("Existing artifact context:\n%s", artifactContext.PromptText())),
 	}})
 
 	finalTexts := make([]string, 0)
@@ -196,7 +196,6 @@ Execute the provided plan using Eino tools and Eino skills only. The original pl
 - doc.update -> doc_update
 - slide.generate -> slide_generate
 - slide.regenerate -> slide_regenerate
-- slide.rehearse -> slide_rehearse
 - archive.bundle -> archive_bundle
 - sync.broadcast -> sync_broadcast
 
@@ -207,9 +206,28 @@ Rules:
 4. Before any slide or PPT tool, call skill with skill=slide_generation and follow the returned instructions.
 5. Pass stepId, original dotted tool name, and description in plan tool arguments.
 6. For doc_create/doc_append/doc_generate/doc_update, generate the final user-facing Markdown yourself and pass it as content. For doc_update, produce the full revised document, not a patch.
-7. For slide_generate/slide_regenerate, generate the final Slidev Markdown yourself and pass it as slidevMarkdown. For slide_rehearse, generate speaker notes and pass them as speakerNotes.
+7. For slide_generate/slide_regenerate, generate final genppt-compatible Markdown yourself and pass it as slideMarkdown. Use '# ' to create each slide, '## ' for slide headings, and Markdown lists for bullets.
 8. Do not call artifact tools for greeting or status-only tasks.
 9. After tool calls complete, summarize what was produced.`
+}
+
+func adkExecutionPrompt(task domain.Task, planJSON string) string {
+	return fmt.Sprintf(`Task ID: %s
+Title: %s
+Instruction: %s
+
+Authoritative plan JSON:
+%s
+
+Execution rules:
+1. Treat the plan as binding. Follow dependency order and do not skip any applicable step.
+2. Execute every required plan tool exactly once unless a prerequisite is missing or the plan itself is impossible to satisfy.
+3. If the plan includes doc creation or update, load and follow the document_generation skill before calling any doc tool.
+4. If the plan includes slide or PPT generation, load and follow the slide_generation skill before calling any slide tool.
+5. For doc_update and slide_regenerate, use the existing artifact context as the baseline and apply the user's latest revision request; do not regenerate from scratch unless the user explicitly asks.
+6. Do not regenerate from scratch unless the user explicitly asks.
+7. Call every required plan tool exactly once using the safe tool names described in the system message. Do not invent artifacts.`,
+		task.TaskID, task.Title, task.UserInstruction, planJSON)
 }
 
 type agentModelConfig struct {

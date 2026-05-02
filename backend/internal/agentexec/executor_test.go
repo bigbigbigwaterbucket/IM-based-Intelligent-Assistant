@@ -67,7 +67,7 @@ func TestEnrichStepInputWithContextForRevisionTools(t *testing.T) {
 	if slideInput.ExistingSlides != "# Old Slides" {
 		t.Fatalf("expected slide context, got %q", slideInput.ExistingSlides)
 	}
-	if slideInput.SlidevMarkdown != "" {
-		t.Fatalf("did not expect existing slides to be treated as generated content: %q", slideInput.SlidevMarkdown)
+	if slideInput.SlideMarkdown != "" {
+		t.Fatalf("did not expect existing slides to be treated as generated content: %q", slideInput.SlideMarkdown)
 	}
 }

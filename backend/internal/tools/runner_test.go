@@ -3,7 +3,6 @@ package tools
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,7 +29,7 @@ func TestCreateDocAndSlidesWriteArtifacts(t *testing.T) {
 			{Heading: "背景", Bullets: []string{"不是占位链接"}},
 		},
 		Slides: []domain.Slide{
-			{Title: "首页", Bullets: []string{"真实 Slidev Markdown"}, SpeakerNote: "说明首页。"},
+			{Title: "首页", Bullets: []string{"真实 PPT Markdown"}},
 		},
 	}
 
@@ -45,21 +44,22 @@ func TestCreateDocAndSlidesWriteArtifacts(t *testing.T) {
 	assertFileNotContains(t, doc.ArtifactPath, "## 意图分析")
 	assertFileNotContains(t, doc.ArtifactPath, "## 执行计划")
 
-	slides := runner.CreateSlides(context.Background(), plan, "", "")
+	slides := runner.CreateSlides(context.Background(), plan, "")
 	if !slides.Success {
 		t.Fatalf("create slides failed: %s", slides.ErrorMessage)
 	}
 	if !strings.HasPrefix(slides.ArtifactURL, "/artifacts/") {
 		t.Fatalf("unexpected slides url: %s", slides.ArtifactURL)
 	}
-	assertFileContains(t, slides.ArtifactPath, "theme: seriph")
-
-	notesURL := slides.Data["speaker_notes"]
-	if notesURL == "" {
-		t.Fatal("expected speaker notes artifact")
+	if !strings.HasSuffix(slides.ArtifactURL, ".pptx") {
+		t.Fatalf("expected pptx artifact url, got %s", slides.ArtifactURL)
 	}
-	notesPath := filepath.Join(runner.config.ArtifactDir, strings.TrimPrefix(notesURL, "/artifacts/"))
-	assertFileContains(t, notesPath, "说明首页")
+	assertFileContains(t, slides.ArtifactPath, "# 测试演示稿")
+	pptxPath := slides.Data["pptx_path"]
+	if pptxPath == "" {
+		t.Fatal("expected pptx path")
+	}
+	assertFileExists(t, pptxPath)
 }
 
 func TestCreateDocUsesFetchedChatMessages(t *testing.T) {
@@ -117,29 +117,27 @@ func TestCreateDocUsesGeneratedMarkdown(t *testing.T) {
 	}
 }
 
-func TestCreateSlidesUsesGeneratedMarkdownAndUpdatesNotes(t *testing.T) {
+func TestCreateSlidesUsesGeneratedMarkdownAndWritesPPTX(t *testing.T) {
 	t.Parallel()
 
 	runner := NewRunner(Config{ArtifactDir: t.TempDir()})
 	plan := domain.Plan{SlideTitle: "Generated Slides"}
 
-	slides := runner.CreateSlides(context.Background(), plan, "---\ntheme: default\n---\n\n# Agent Slide", "")
+	slides := runner.CreateSlides(context.Background(), plan, "# Agent Slide\n\n## Summary\n\n- One\n- Two")
 	if !slides.Success {
 		t.Fatalf("create slides failed: %s", slides.ErrorMessage)
 	}
 	assertFileContains(t, slides.ArtifactPath, "# Agent Slide")
-	if got := slides.Data["content_source"]; got != "agent_slidev_markdown" {
+	if got := slides.Data["content_source"]; got != "agent_markdown" {
 		t.Fatalf("expected agent slide source, got %q", got)
 	}
-
-	notes := runner.CreateSpeakerNotes(context.Background(), plan, "# Notes\n\nSay this.", slides)
-	if !notes.Success {
-		t.Fatalf("create speaker notes failed: %s", notes.ErrorMessage)
+	if got := slides.Data["source"]; got != "genppt_pptx" {
+		t.Fatalf("expected genppt source, got %q", got)
 	}
-	assertFileContains(t, notes.ArtifactPath, "Say this.")
-	if got := notes.Data["notes_source"]; got != "agent_speaker_notes" {
-		t.Fatalf("expected agent notes source, got %q", got)
+	if !strings.HasSuffix(slides.ArtifactURL, ".pptx") {
+		t.Fatalf("expected pptx artifact url, got %s", slides.ArtifactURL)
 	}
+	assertFileExists(t, slides.Data["pptx_path"])
 }
 
 func TestValidateConvertedBlocks(t *testing.T) {
@@ -223,5 +221,20 @@ func assertFileNotContains(t *testing.T, path, want string) {
 	}
 	if strings.Contains(string(data), want) {
 		t.Fatalf("expected %s not to contain %q", path, want)
+	}
+}
+
+func assertFileExists(t *testing.T, path string) {
+	t.Helper()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("expected %s to exist: %v", path, err)
+	}
+	if info.IsDir() {
+		t.Fatalf("expected %s to be a file", path)
+	}
+	if info.Size() == 0 {
+		t.Fatalf("expected %s to be non-empty", path)
 	}
 }

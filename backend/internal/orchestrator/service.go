@@ -152,7 +152,7 @@ func (s *Service) ContinueTask(ctx context.Context, input ContinueTaskInput) (do
 	}
 	_ = s.upsertSession(ctx, input.SessionID, task)
 
-	plan := buildRevisionPlan(task, revision)
+	plan := s.buildRevisionPlan(ctx, task, revision)
 	go s.runPreparedPlan(context.Background(), task.TaskID, plan)
 	return task, nil
 }
@@ -402,18 +402,11 @@ func (s *Service) runToolStep(ctx context.Context, task domain.Task, plan domain
 		if *slidesGenerated {
 			return s.tools.CompleteStep(step)
 		}
-		*slidesResult = s.tools.CreateSlides(ctx, plan, "", "")
+		*slidesResult = s.tools.CreateSlides(ctx, plan, "")
 		*slidesGenerated = slidesResult.Success
 		return *slidesResult
 	case "slide.regenerate":
-		*slidesResult = s.tools.RegenerateSlides(ctx, task, plan, "", "")
-		*slidesGenerated = slidesResult.Success
-		return *slidesResult
-	case "slide.rehearse":
-		if *slidesGenerated {
-			return s.tools.CompleteStep(step)
-		}
-		*slidesResult = s.tools.CreateSlides(ctx, plan, "", "")
+		*slidesResult = s.tools.RegenerateSlides(ctx, task, plan, "")
 		*slidesGenerated = slidesResult.Success
 		return *slidesResult
 	case "archive.bundle":
@@ -661,71 +654,18 @@ func revisionInstruction(original, revision string) string {
 	return original + "\n\nRevision request: " + revision
 }
 
-func buildRevisionPlan(task domain.Task, instruction string) domain.Plan {
-	steps := []domain.PlanStep{
-		{ID: "r1", Tool: "intent.analyze", Description: "Analyze revision request"},
+func (s *Service) buildRevisionPlan(ctx context.Context, task domain.Task, instruction string) domain.Plan {
+	if revisionPlanner, ok := s.planner.(planner.RevisionBuilder); ok {
+		plan, err := revisionPlanner.BuildRevisionPlan(ctx, task, instruction)
+		if err == nil {
+			return plan
+		}
+		plan = planner.BuildHeuristicRevisionPlan(task, instruction)
+		plan.PlannerSource = "revision_fallback"
+		plan.PlannerError = err.Error()
+		return plan
 	}
-	deps := []string{"r1"}
-	if task.DocURL != "" || task.DocID != "" {
-		steps = append(steps, domain.PlanStep{
-			ID:          "r2",
-			Tool:        "doc.update",
-			Description: "Update existing Feishu Docx content in place",
-			DependsOn:   deps,
-			Args:        map[string]any{"revision": instruction},
-		})
-		deps = []string{"r2"}
-	}
-	if task.SlidesURL != "" {
-		slideID := fmt.Sprintf("r%d", len(steps)+1)
-		steps = append(steps, domain.PlanStep{
-			ID:          slideID,
-			Tool:        "slide.regenerate",
-			Description: "Regenerate Slidev presentation from the revised document direction",
-			DependsOn:   deps,
-			Args:        map[string]any{"revision": instruction},
-		})
-		deps = []string{slideID}
-	}
-	if len(steps) == 1 {
-		steps = append(steps, domain.PlanStep{
-			ID:          "r2",
-			Tool:        "sync.broadcast",
-			Description: "Record revision request without artifact changes",
-			DependsOn:   deps,
-		})
-	}
-	return domain.Plan{
-		Summary:       "Apply user revision to existing task artifacts.",
-		PlannerSource: "revision",
-		Analysis: domain.IntentAnalysis{
-			Objective:    "Revise existing task artifacts based on user feedback.",
-			Audience:     "Existing task reviewers",
-			Deliverables: revisionDeliverables(task),
-		},
-		Steps:      steps,
-		DocTitle:   task.Title,
-		SlideTitle: task.Title,
-		DocumentSections: []domain.DocumentSection{{
-			Heading: "Revision request",
-			Bullets: []string{instruction},
-		}},
-		Slides: []domain.Slide{{
-			Title:   task.Title,
-			Bullets: []string{instruction},
-		}},
-	}
-}
-
-func revisionDeliverables(task domain.Task) []string {
-	var deliverables []string
-	if task.DocURL != "" || task.DocID != "" {
-		deliverables = append(deliverables, "document")
-	}
-	if task.SlidesURL != "" {
-		deliverables = append(deliverables, "slides")
-	}
-	return deliverables
+	return planner.BuildHeuristicRevisionPlan(task, instruction)
 }
 
 func sessionIDForTask(task domain.Task) string {
@@ -792,8 +732,6 @@ func toolDisplayName(tool string) string {
 		return "写入文档"
 	case "slide.generate":
 		return "生成演示稿"
-	case "slide.rehearse":
-		return "生成演讲稿"
 	case "archive.bundle":
 		return "汇总产物"
 	case "sync.broadcast":

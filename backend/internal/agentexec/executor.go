@@ -198,9 +198,8 @@ func newToolSet(runner *tools.Runner, sink ProgressSink, history store.HistoryRe
 		"doc.append":       wrap("doc.append", "Append document", "Append structured content to the task document artifact."),
 		"doc.generate":     wrap("doc.generate", "Generate document", "Generate the task document artifact."),
 		"doc.update":       wrap("doc.update", "Update document", "Update the existing task document artifact in place when possible."),
-		"slide.generate":   wrap("slide.generate", "Generate slides", "Generate the task Slidev presentation artifact."),
-		"slide.regenerate": wrap("slide.regenerate", "Regenerate slides", "Regenerate the task Slidev presentation artifact."),
-		"slide.rehearse":   wrap("slide.rehearse", "Generate speaker notes", "Generate or confirm speaker notes for the slides."),
+		"slide.generate":   wrap("slide.generate", "Generate slides", "Generate the task PPTX presentation artifact from Markdown."),
+		"slide.regenerate": wrap("slide.regenerate", "Regenerate slides", "Regenerate the task PPTX presentation artifact from Markdown."),
 		"archive.bundle":   wrap("archive.bundle", "Bundle artifacts", "Bundle task artifacts into a manifest."),
 		"sync.broadcast":   wrap("sync.broadcast", "Broadcast status", "Broadcast task status without creating artifacts."),
 	}
@@ -304,24 +303,13 @@ func (t *executionTool) execute(ctx context.Context, step domain.PlanStep, input
 		if t.state.slidesGenerated {
 			return t.runner.CompleteStep(step)
 		}
-		t.state.slidesResult = t.runner.CreateSlides(ctx, t.plan, input.slidevContent(), input.speakerNotesContent())
+		t.state.slidesResult = t.runner.CreateSlides(ctx, t.plan, input.slideMarkdownContent())
 		t.state.slidesGenerated = t.state.slidesResult.Success
 		return t.state.slidesResult
 	case "slide.regenerate":
-		t.state.slidesResult = t.runner.RegenerateSlides(ctx, t.task, t.plan, input.slidevContent(), input.speakerNotesContent())
+		t.state.slidesResult = t.runner.RegenerateSlides(ctx, t.task, t.plan, input.slideMarkdownContent())
 		t.state.slidesGenerated = t.state.slidesResult.Success
 		return t.state.slidesResult
-	case "slide.rehearse":
-		if !t.state.slidesGenerated {
-			t.state.slidesResult = t.runner.CreateSlides(ctx, t.plan, input.slidevContent(), input.speakerNotesContent())
-			t.state.slidesGenerated = t.state.slidesResult.Success
-			return t.state.slidesResult
-		}
-		result := t.runner.CreateSpeakerNotes(ctx, t.plan, input.speakerNotesContent(), t.state.slidesResult)
-		if result.Success {
-			t.mergeSlideResultData(result)
-		}
-		return result
 	case "archive.bundle":
 		return t.runner.Bundle(ctx, t.task, t.plan, t.state.docResult, t.state.slidesResult)
 	case "sync.broadcast":
@@ -331,26 +319,13 @@ func (t *executionTool) execute(ctx context.Context, step domain.PlanStep, input
 	}
 }
 
-func (t *executionTool) mergeSlideResultData(result tools.Result) {
-	if t.state.slidesResult.Data == nil {
-		t.state.slidesResult.Data = map[string]string{}
-	}
-	for key, value := range result.Data {
-		t.state.slidesResult.Data[key] = value
-	}
-	if result.ArtifactURL != "" {
-		t.state.slidesResult.ArtifactURL = result.ArtifactURL
-	}
-}
-
 type stepToolInput struct {
 	StepID         string         `json:"stepId"`
 	Tool           string         `json:"tool"`
 	Description    string         `json:"description"`
 	Content        string         `json:"content,omitempty"`
 	Markdown       string         `json:"markdown,omitempty"`
-	SlidevMarkdown string         `json:"slidevMarkdown,omitempty"`
-	SpeakerNotes   string         `json:"speakerNotes,omitempty"`
+	SlideMarkdown  string         `json:"slideMarkdown,omitempty"`
 	ExistingDoc    string         `json:"existingDocument,omitempty"`
 	ExistingSlides string         `json:"existingSlides,omitempty"`
 	RecentHistory  string         `json:"recentHistory,omitempty"`
@@ -369,7 +344,7 @@ func (c artifactContext) PromptText() string {
 		parts = append(parts, "Existing document Markdown:\n"+c.Document)
 	}
 	if strings.TrimSpace(c.Slides) != "" {
-		parts = append(parts, "Existing Slidev Markdown:\n"+c.Slides)
+		parts = append(parts, "Existing slide Markdown:\n"+c.Slides)
 	}
 	if strings.TrimSpace(c.History) != "" {
 		parts = append(parts, "Recent conversation:\n"+c.History)
@@ -459,9 +434,9 @@ func (i stepToolInput) documentContent() string {
 	return stringArg(i.Args, "content", "markdown", "documentMarkdown", "document")
 }
 
-func (i stepToolInput) slidevContent() string {
-	if strings.TrimSpace(i.SlidevMarkdown) != "" {
-		return i.SlidevMarkdown
+func (i stepToolInput) slideMarkdownContent() string {
+	if strings.TrimSpace(i.SlideMarkdown) != "" {
+		return i.SlideMarkdown
 	}
 	if strings.TrimSpace(i.Content) != "" {
 		return i.Content
@@ -469,14 +444,7 @@ func (i stepToolInput) slidevContent() string {
 	if strings.TrimSpace(i.Markdown) != "" {
 		return i.Markdown
 	}
-	return stringArg(i.Args, "slidevMarkdown", "content", "markdown", "slides")
-}
-
-func (i stepToolInput) speakerNotesContent() string {
-	if strings.TrimSpace(i.SpeakerNotes) != "" {
-		return i.SpeakerNotes
-	}
-	return stringArg(i.Args, "speakerNotes", "notes")
+	return stringArg(i.Args, "slideMarkdown", "slidevMarkdown", "content", "markdown", "slides")
 }
 
 func stringArg(args map[string]any, keys ...string) string {
@@ -615,20 +583,9 @@ func toolInfo(name, description, planName string) *schema.ToolInfo {
 			Required: true,
 		}
 	case "slide.generate", "slide.regenerate":
-		params["slidevMarkdown"] = &schema.ParameterInfo{
+		params["slideMarkdown"] = &schema.ParameterInfo{
 			Type:     schema.String,
-			Desc:     "Complete Slidev Markdown presentation content to persist. Include frontmatter and all slides.",
-			Required: true,
-		}
-		params["speakerNotes"] = &schema.ParameterInfo{
-			Type:     schema.String,
-			Desc:     "Optional speaker notes Markdown. If omitted, call slide_rehearse later with complete notes.",
-			Required: false,
-		}
-	case "slide.rehearse":
-		params["speakerNotes"] = &schema.ParameterInfo{
-			Type:     schema.String,
-			Desc:     "Complete speaker notes Markdown for the generated presentation.",
+			Desc:     "Complete genppt-compatible Markdown presentation content. Use '# ' to create each slide, '## ' for slide headings, and Markdown lists for bullets.",
 			Required: true,
 		}
 	}
@@ -662,7 +619,7 @@ func planNeedsDoc(plan domain.Plan) bool {
 
 func planNeedsSlides(plan domain.Plan) bool {
 	for _, step := range plan.Steps {
-		if step.Tool == "slide.generate" || step.Tool == "slide.regenerate" || step.Tool == "slide.rehearse" {
+		if step.Tool == "slide.generate" || step.Tool == "slide.regenerate" {
 			return true
 		}
 	}

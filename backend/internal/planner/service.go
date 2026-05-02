@@ -13,8 +13,13 @@ type Builder interface {
 	BuildPlan(ctx context.Context, title, instruction string) (domain.Plan, error)
 }
 
+type RevisionBuilder interface {
+	BuildRevisionPlan(ctx context.Context, task domain.Task, instruction string) (domain.Plan, error)
+}
+
 type llmBuilder interface {
 	Builder
+	RevisionBuilder
 	Enabled() bool
 }
 
@@ -63,6 +68,32 @@ func (s *Service) BuildPlan(ctx context.Context, title, instruction string) (dom
 	return buildHeuristicPlan(title, instruction)
 }
 
+func (s *Service) BuildRevisionPlan(ctx context.Context, task domain.Task, instruction string) (domain.Plan, error) {
+	instruction = strings.TrimSpace(instruction)
+	if instruction == "" {
+		return domain.Plan{}, fmt.Errorf("instruction is required")
+	}
+
+	if s.llm != nil && s.llm.Enabled() {
+		plan, err := s.llm.BuildRevisionPlan(ctx, task, instruction)
+		if err == nil && validRevisionPlan(plan, task) {
+			plan.PlannerSource = "llm_revision"
+			return plan, nil
+		}
+		if err == nil {
+			err = fmt.Errorf("llm revision planner returned incomplete plan")
+		}
+		if err != nil {
+			plan := BuildHeuristicRevisionPlan(task, instruction)
+			plan.PlannerSource = "revision_fallback"
+			plan.PlannerError = err.Error()
+			return plan, nil
+		}
+	}
+
+	return BuildHeuristicRevisionPlan(task, instruction), nil
+}
+
 func buildHeuristicPlan(title, instruction string) (domain.Plan, error) {
 	analysis := analyzeIntent(instruction)
 	docTitle := title + " - 方案文档"
@@ -85,6 +116,9 @@ func buildHeuristicPlan(title, instruction string) (domain.Plan, error) {
 }
 
 func validPlan(plan domain.Plan) bool {
+	if hasDeprecatedTool(plan, "slide.rehearse") {
+		return false
+	}
 	needsDoc := planNeedsDoc(plan)
 	needsSlides := planNeedsSlides(plan)
 	if hasDeliverable(plan.Analysis, "方案文档") && !needsDoc {
@@ -98,6 +132,112 @@ func validPlan(plan domain.Plan) bool {
 		len(plan.Steps) > 0 &&
 		(!needsDoc || (plan.DocTitle != "" && len(plan.DocumentSections) > 0)) &&
 		(!needsSlides || (plan.SlideTitle != "" && len(plan.Slides) > 0))
+}
+
+func hasDeprecatedTool(plan domain.Plan, tool string) bool {
+	for _, step := range plan.Steps {
+		if step.Tool == tool {
+			return true
+		}
+	}
+	return false
+}
+
+func validRevisionPlan(plan domain.Plan, task domain.Task) bool {
+	if hasDeprecatedTool(plan, "slide.rehearse") {
+		return false
+	}
+	if plan.Summary == "" || plan.Analysis.Objective == "" || len(plan.Steps) == 0 {
+		return false
+	}
+	hasExecutableStep := false
+	for _, step := range plan.Steps {
+		switch step.Tool {
+		case "intent.analyze", "planner.build":
+		case "doc.update":
+			if task.DocURL == "" && task.DocID == "" {
+				return false
+			}
+			hasExecutableStep = true
+		case "slide.regenerate":
+			if task.SlidesURL == "" {
+				return false
+			}
+			hasExecutableStep = true
+		case "sync.broadcast":
+			hasExecutableStep = true
+		default:
+			return false
+		}
+	}
+	return hasExecutableStep
+}
+
+func BuildHeuristicRevisionPlan(task domain.Task, instruction string) domain.Plan {
+	steps := []domain.PlanStep{
+		{ID: "r1", Tool: "intent.analyze", Description: "Analyze revision request"},
+	}
+	deps := []string{"r1"}
+	if task.DocURL != "" || task.DocID != "" {
+		steps = append(steps, domain.PlanStep{
+			ID:          "r2",
+			Tool:        "doc.update",
+			Description: "Update existing Feishu Docx content in place",
+			DependsOn:   deps,
+			Args:        map[string]any{"revision": instruction},
+		})
+		deps = []string{"r2"}
+	}
+	if task.SlidesURL != "" {
+		slideID := fmt.Sprintf("r%d", len(steps)+1)
+		steps = append(steps, domain.PlanStep{
+			ID:          slideID,
+			Tool:        "slide.regenerate",
+			Description: "Regenerate PPTX presentation from the revised document direction",
+			DependsOn:   deps,
+			Args:        map[string]any{"revision": instruction},
+		})
+		deps = []string{slideID}
+	}
+	if len(steps) == 1 {
+		steps = append(steps, domain.PlanStep{
+			ID:          "r2",
+			Tool:        "sync.broadcast",
+			Description: "Record revision request without artifact changes",
+			DependsOn:   deps,
+		})
+	}
+	return domain.Plan{
+		Summary:       "按用户要求执行更新任务",
+		PlannerSource: "revision",
+		Analysis: domain.IntentAnalysis{
+			Objective:    "Revise existing task artifacts based on user feedback.",
+			Audience:     "Existing task reviewers",
+			Deliverables: revisionDeliverables(task),
+		},
+		Steps:      steps,
+		DocTitle:   task.Title,
+		SlideTitle: task.Title,
+		DocumentSections: []domain.DocumentSection{{
+			Heading: "Revision request",
+			Bullets: []string{instruction},
+		}},
+		Slides: []domain.Slide{{
+			Title:   task.Title,
+			Bullets: []string{instruction},
+		}},
+	}
+}
+
+func revisionDeliverables(task domain.Task) []string {
+	var deliverables []string
+	if task.DocURL != "" || task.DocID != "" {
+		deliverables = append(deliverables, "document")
+	}
+	if task.SlidesURL != "" {
+		deliverables = append(deliverables, "slides")
+	}
+	return deliverables
 }
 
 func analyzeIntent(instruction string) domain.IntentAnalysis {
@@ -194,11 +334,8 @@ func buildSteps(analysis domain.IntentAnalysis) []domain.PlanStep {
 		if len(artifactDeps) > 0 {
 			deps = []string{artifactDeps[len(artifactDeps)-1]}
 		}
-		steps = append(steps, domain.PlanStep{ID: slideID, Tool: "slide.generate", Description: "生成 Slidev 演示稿 Markdown", DependsOn: deps})
-		rehearseID := fmt.Sprintf("s%d", nextID)
-		nextID++
-		steps = append(steps, domain.PlanStep{ID: rehearseID, Tool: "slide.rehearse", Description: "生成演讲稿", DependsOn: []string{slideID}})
-		artifactDeps = append(artifactDeps, rehearseID)
+		steps = append(steps, domain.PlanStep{ID: slideID, Tool: "slide.generate", Description: "生成可转换为 PPTX 的演示稿 Markdown", DependsOn: deps})
+		artifactDeps = append(artifactDeps, slideID)
 	}
 	if len(artifactDeps) > 0 {
 		steps = append(steps, domain.PlanStep{ID: fmt.Sprintf("s%d", nextID), Tool: "archive.bundle", Description: "汇总所有产物并生成 manifest", DependsOn: artifactDeps})
@@ -232,7 +369,7 @@ func buildDocumentSections(instruction string, analysis domain.IntentAnalysis) [
 				"第一步：完成意图分析，明确这次任务的受众、交付物、上下文依赖和风险。",
 				"第二步：生成方案文档，按背景、目标、核心方案、执行计划、风险与待确认事项组织。",
 				"第三步：基于文档生成演示稿，保证 PPT 不是重新发散，而是从文档中抽取汇报主线。",
-				"第四步：生成 manifest，把文档、演示稿、演讲稿和规划信息统一归档。",
+				"第四步：生成 manifest，把文档、PPTX 演示稿和规划信息统一归档。",
 			},
 		},
 		{
@@ -313,7 +450,7 @@ func buildSlides(title, instruction string, analysis domain.IntentAnalysis) []do
 				"意图分析",
 				"任务规划",
 				"文档生成",
-				"PPT 与演讲稿生成",
+				"PPT 生成",
 				"产物归档与回传",
 			},
 			SpeakerNote: "强调这是自动化链路，不是单次文本生成。",
