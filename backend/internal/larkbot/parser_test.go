@@ -32,6 +32,33 @@ func TestParseTextContentAssistantAliasAndMention(t *testing.T) {
 	}
 }
 
+func TestParseTextContentAssistantMentionUserPrefix(t *testing.T) {
+	t.Parallel()
+
+	cmd, ok := ParseTextContent("text", `{"text":"@_user_1 /assistant 修改文档标题"}`)
+	if !ok {
+		t.Fatal("expected command")
+	}
+	if cmd.Intent != "修改文档标题" {
+		t.Fatalf("unexpected intent: %q", cmd.Intent)
+	}
+}
+
+func TestParseTextContentAssistantNewCommand(t *testing.T) {
+	t.Parallel()
+
+	cmd, ok := ParseTextContent("text", `{"text":"/assistant new 重新生成方案"}`)
+	if !ok {
+		t.Fatal("expected command")
+	}
+	if !cmd.New {
+		t.Fatal("expected new command")
+	}
+	if cmd.Intent != "重新生成方案" {
+		t.Fatalf("unexpected intent: %q", cmd.Intent)
+	}
+}
+
 func TestParseTextContentHelp(t *testing.T) {
 	t.Parallel()
 

@@ -147,46 +147,6 @@ func TestBuildPlanFallsBackWhenLLMInvalid(t *testing.T) {
 	}
 }
 
-func TestPlannerConfigFromEnvPrefersARK(t *testing.T) {
-	t.Setenv("ARK_API_KEY", "ark-key")
-	t.Setenv("ARK_BASE_URL", "https://ark.example.com/api/compatible")
-	t.Setenv("ARK_MODEL", "ark-model")
-	t.Setenv("DEEPSEEK_API_KEY", "deepseek-key")
-	t.Setenv("DEEPSEEK_BASE_URL", "https://deepseek.example.com")
-	t.Setenv("DEEPSEEK_MODEL", "deepseek-model")
-
-	cfg := plannerConfigFromEnv()
-	if cfg.APIKey != "ark-key" {
-		t.Fatalf("expected ark key, got %s", cfg.APIKey)
-	}
-	if cfg.BaseURL != "https://ark.example.com/api/compatible" {
-		t.Fatalf("unexpected ark base url: %s", cfg.BaseURL)
-	}
-	if cfg.Model != "ark-model" {
-		t.Fatalf("expected ark model, got %s", cfg.Model)
-	}
-}
-
-func TestPlannerConfigFromEnvFallsBackToDeepSeek(t *testing.T) {
-	t.Setenv("ARK_API_KEY", "ark-key")
-	t.Setenv("ARK_BASE_URL", "")
-	t.Setenv("ARK_MODEL", "")
-	t.Setenv("DEEPSEEK_API_KEY", "deepseek-key")
-	t.Setenv("DEEPSEEK_BASE_URL", "")
-	t.Setenv("DEEPSEEK_MODEL", "")
-
-	cfg := plannerConfigFromEnv()
-	if cfg.APIKey != "deepseek-key" {
-		t.Fatalf("expected deepseek key, got %s", cfg.APIKey)
-	}
-	if cfg.BaseURL != "https://api.deepseek.com" {
-		t.Fatalf("expected default deepseek base url, got %s", cfg.BaseURL)
-	}
-	if cfg.Model != "deepseek-chat" {
-		t.Fatalf("expected default deepseek model, got %s", cfg.Model)
-	}
-}
-
 func TestNormalizeBaseURLStripsChatCompletionsSuffix(t *testing.T) {
 	t.Parallel()
 

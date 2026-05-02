@@ -20,9 +20,15 @@ type TaskRepository interface {
 
 type HistoryRepository interface {
 	UpsertSession(ctx context.Context, session domain.Session) error
+	GetSession(ctx context.Context, sessionID string) (domain.Session, error)
 	AppendMessage(ctx context.Context, message domain.ConversationMessage) error
 	AppendToolInvocation(ctx context.Context, invocation domain.ToolInvocation) error
 	ListMessages(ctx context.Context, sessionID string, limit int) ([]domain.ConversationMessage, error)
+}
+
+type ActiveTaskRepository interface {
+	FindActiveTaskBySession(ctx context.Context, sessionID string) (domain.Task, error)
+	ListIdleWaitingTasks(ctx context.Context, cutoff time.Time) ([]domain.Task, error)
 }
 
 type SQLiteStore struct {
@@ -52,11 +58,16 @@ func (s *SQLiteStore) migrate() error {
 			progress_text TEXT NOT NULL,
 			doc_url TEXT NOT NULL,
 			slides_url TEXT NOT NULL,
+			doc_id TEXT NOT NULL DEFAULT '',
+			doc_artifact_path TEXT NOT NULL DEFAULT '',
+			slides_artifact_path TEXT NOT NULL DEFAULT '',
 			summary TEXT NOT NULL,
 			requires_action INTEGER NOT NULL,
 			error_message TEXT NOT NULL,
 			version INTEGER NOT NULL,
 			last_actor TEXT NOT NULL,
+			last_interaction_at TEXT NOT NULL DEFAULT '',
+			idle_prompted_at TEXT NOT NULL DEFAULT '',
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL,
 			steps_json TEXT NOT NULL
@@ -112,6 +123,11 @@ func (s *SQLiteStore) migrate() error {
 		{name: "chat_id", ddl: "ALTER TABLE tasks ADD COLUMN chat_id TEXT NOT NULL DEFAULT ''"},
 		{name: "thread_id", ddl: "ALTER TABLE tasks ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''"},
 		{name: "message_id", ddl: "ALTER TABLE tasks ADD COLUMN message_id TEXT NOT NULL DEFAULT ''"},
+		{name: "doc_id", ddl: "ALTER TABLE tasks ADD COLUMN doc_id TEXT NOT NULL DEFAULT ''"},
+		{name: "doc_artifact_path", ddl: "ALTER TABLE tasks ADD COLUMN doc_artifact_path TEXT NOT NULL DEFAULT ''"},
+		{name: "slides_artifact_path", ddl: "ALTER TABLE tasks ADD COLUMN slides_artifact_path TEXT NOT NULL DEFAULT ''"},
+		{name: "last_interaction_at", ddl: "ALTER TABLE tasks ADD COLUMN last_interaction_at TEXT NOT NULL DEFAULT ''"},
+		{name: "idle_prompted_at", ddl: "ALTER TABLE tasks ADD COLUMN idle_prompted_at TEXT NOT NULL DEFAULT ''"},
 	} {
 		ok, err := s.hasColumn("tasks", column.name)
 		if err != nil {
@@ -136,14 +152,17 @@ func (s *SQLiteStore) Create(ctx context.Context, task domain.Task) (domain.Task
 		INSERT INTO tasks (
 			task_id, title, user_instruction, source, status, current_step, progress_text,
 			chat_id, thread_id, message_id,
-			doc_url, slides_url, summary, requires_action, error_message, version,
-			last_actor, created_at, updated_at, steps_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			doc_url, slides_url, doc_id, doc_artifact_path, slides_artifact_path,
+			summary, requires_action, error_message, version,
+			last_actor, last_interaction_at, idle_prompted_at, created_at, updated_at, steps_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		task.TaskID, task.Title, task.UserInstruction, task.Source, task.Status, task.CurrentStep, task.ProgressText,
 		task.ChatID, task.ThreadID, task.MessageID,
-		task.DocURL, task.SlidesURL, task.Summary, boolToInt(task.RequiresAction), task.ErrorMessage, task.Version,
-		task.LastActor, task.CreatedAt.Format(time.RFC3339Nano), task.UpdatedAt.Format(time.RFC3339Nano), string(stepsJSON),
+		task.DocURL, task.SlidesURL, task.DocID, task.DocArtifactPath, task.SlidesArtifactPath,
+		task.Summary, boolToInt(task.RequiresAction), task.ErrorMessage, task.Version,
+		task.LastActor, formatTimePtr(task.LastInteractionAt), formatTimePtr(task.IdlePromptedAt),
+		task.CreatedAt.Format(time.RFC3339Nano), task.UpdatedAt.Format(time.RFC3339Nano), string(stepsJSON),
 	)
 	if err != nil {
 		return domain.Task{}, err
@@ -161,14 +180,18 @@ func (s *SQLiteStore) Update(ctx context.Context, task domain.Task) (domain.Task
 		UPDATE tasks
 		SET title = ?, user_instruction = ?, source = ?, status = ?, current_step = ?, progress_text = ?,
 			chat_id = ?, thread_id = ?, message_id = ?,
-			doc_url = ?, slides_url = ?, summary = ?, requires_action = ?, error_message = ?,
-			version = ?, last_actor = ?, created_at = ?, updated_at = ?, steps_json = ?
+			doc_url = ?, slides_url = ?, doc_id = ?, doc_artifact_path = ?, slides_artifact_path = ?,
+			summary = ?, requires_action = ?, error_message = ?,
+			version = ?, last_actor = ?, last_interaction_at = ?, idle_prompted_at = ?,
+			created_at = ?, updated_at = ?, steps_json = ?
 		WHERE task_id = ?
 	`,
 		task.Title, task.UserInstruction, task.Source, task.Status, task.CurrentStep, task.ProgressText,
 		task.ChatID, task.ThreadID, task.MessageID,
-		task.DocURL, task.SlidesURL, task.Summary, boolToInt(task.RequiresAction), task.ErrorMessage,
-		task.Version, task.LastActor, task.CreatedAt.Format(time.RFC3339Nano), task.UpdatedAt.Format(time.RFC3339Nano),
+		task.DocURL, task.SlidesURL, task.DocID, task.DocArtifactPath, task.SlidesArtifactPath,
+		task.Summary, boolToInt(task.RequiresAction), task.ErrorMessage,
+		task.Version, task.LastActor, formatTimePtr(task.LastInteractionAt), formatTimePtr(task.IdlePromptedAt),
+		task.CreatedAt.Format(time.RFC3339Nano), task.UpdatedAt.Format(time.RFC3339Nano),
 		string(stepsJSON), task.TaskID,
 	)
 	if err != nil {
@@ -185,8 +208,9 @@ func (s *SQLiteStore) Get(ctx context.Context, taskID string) (domain.Task, erro
 	row := s.db.QueryRowContext(ctx, `
 		SELECT task_id, title, user_instruction, source, status, current_step, progress_text,
 			chat_id, thread_id, message_id,
-			doc_url, slides_url, summary, requires_action, error_message, version,
-			last_actor, created_at, updated_at, steps_json
+			doc_url, slides_url, doc_id, doc_artifact_path, slides_artifact_path,
+			summary, requires_action, error_message, version,
+			last_actor, last_interaction_at, idle_prompted_at, created_at, updated_at, steps_json
 		FROM tasks
 		WHERE task_id = ?
 	`, taskID)
@@ -197,8 +221,9 @@ func (s *SQLiteStore) List(ctx context.Context) ([]domain.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT task_id, title, user_instruction, source, status, current_step, progress_text,
 			chat_id, thread_id, message_id,
-			doc_url, slides_url, summary, requires_action, error_message, version,
-			last_actor, created_at, updated_at, steps_json
+			doc_url, slides_url, doc_id, doc_artifact_path, slides_artifact_path,
+			summary, requires_action, error_message, version,
+			last_actor, last_interaction_at, idle_prompted_at, created_at, updated_at, steps_json
 		FROM tasks
 		ORDER BY updated_at DESC
 	`)
@@ -232,6 +257,71 @@ func (s *SQLiteStore) UpsertSession(ctx context.Context, session domain.Session)
 		session.CreatedAt.Format(time.RFC3339Nano), session.UpdatedAt.Format(time.RFC3339Nano),
 	)
 	return err
+}
+
+func (s *SQLiteStore) GetSession(ctx context.Context, sessionID string) (domain.Session, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT session_id, task_id, chat_id, thread_id, created_at, updated_at
+		FROM sessions
+		WHERE session_id = ?
+	`, sessionID)
+
+	var session domain.Session
+	var createdAt string
+	var updatedAt string
+	if err := row.Scan(&session.SessionID, &session.TaskID, &session.ChatID, &session.ThreadID, &createdAt, &updatedAt); err != nil {
+		return domain.Session{}, err
+	}
+	session.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	session.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	return session, nil
+}
+
+func (s *SQLiteStore) FindActiveTaskBySession(ctx context.Context, sessionID string) (domain.Task, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT t.task_id, t.title, t.user_instruction, t.source, t.status, t.current_step, t.progress_text,
+			t.chat_id, t.thread_id, t.message_id,
+			t.doc_url, t.slides_url, t.doc_id, t.doc_artifact_path, t.slides_artifact_path,
+			t.summary, t.requires_action, t.error_message, t.version,
+			t.last_actor, t.last_interaction_at, t.idle_prompted_at, t.created_at, t.updated_at, t.steps_json
+		FROM sessions s
+		JOIN tasks t ON t.task_id = s.task_id
+		WHERE s.session_id = ?
+			AND t.status IN (?, ?, ?, ?)
+		ORDER BY t.updated_at DESC
+		LIMIT 1
+	`, sessionID, domain.StatusCreated, domain.StatusPlanning, domain.StatusExecuting, domain.StatusWaitingAction)
+	return scanTask(row)
+}
+
+func (s *SQLiteStore) ListIdleWaitingTasks(ctx context.Context, cutoff time.Time) ([]domain.Task, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT task_id, title, user_instruction, source, status, current_step, progress_text,
+			chat_id, thread_id, message_id,
+			doc_url, slides_url, doc_id, doc_artifact_path, slides_artifact_path,
+			summary, requires_action, error_message, version,
+			last_actor, last_interaction_at, idle_prompted_at, created_at, updated_at, steps_json
+		FROM tasks
+		WHERE status = ?
+			AND chat_id <> ''
+			AND idle_prompted_at = ''
+			AND COALESCE(NULLIF(last_interaction_at, ''), updated_at) <= ?
+		ORDER BY updated_at ASC
+	`, domain.StatusWaitingAction, cutoff.Format(time.RFC3339Nano))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []domain.Task
+	for rows.Next() {
+		task, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	return tasks, rows.Err()
 }
 
 func (s *SQLiteStore) AppendMessage(ctx context.Context, message domain.ConversationMessage) error {
@@ -304,23 +394,28 @@ type scanner interface {
 
 func scanTask(row scanner) (domain.Task, error) {
 	var (
-		task         domain.Task
-		requiresFlag int
-		createdAt    string
-		updatedAt    string
-		stepsJSON    string
+		task              domain.Task
+		requiresFlag      int
+		createdAt         string
+		updatedAt         string
+		lastInteractionAt string
+		idlePromptedAt    string
+		stepsJSON         string
 	)
 	err := row.Scan(
 		&task.TaskID, &task.Title, &task.UserInstruction, &task.Source, &task.Status, &task.CurrentStep, &task.ProgressText,
 		&task.ChatID, &task.ThreadID, &task.MessageID,
-		&task.DocURL, &task.SlidesURL, &task.Summary, &requiresFlag, &task.ErrorMessage, &task.Version,
-		&task.LastActor, &createdAt, &updatedAt, &stepsJSON,
+		&task.DocURL, &task.SlidesURL, &task.DocID, &task.DocArtifactPath, &task.SlidesArtifactPath,
+		&task.Summary, &requiresFlag, &task.ErrorMessage, &task.Version,
+		&task.LastActor, &lastInteractionAt, &idlePromptedAt, &createdAt, &updatedAt, &stepsJSON,
 	)
 	if err != nil {
 		return domain.Task{}, err
 	}
 
 	task.RequiresAction = requiresFlag == 1
+	task.LastInteractionAt = parseTimePtr(lastInteractionAt)
+	task.IdlePromptedAt = parseTimePtr(idlePromptedAt)
 	task.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
 	task.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
 	_ = json.Unmarshal([]byte(stepsJSON), &task.Steps)
@@ -358,4 +453,22 @@ func boolToInt(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+func formatTimePtr(value *time.Time) string {
+	if value == nil || value.IsZero() {
+		return ""
+	}
+	return value.Format(time.RFC3339Nano)
+}
+
+func parseTimePtr(value string) *time.Time {
+	if value == "" {
+		return nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return nil
+	}
+	return &parsed
 }

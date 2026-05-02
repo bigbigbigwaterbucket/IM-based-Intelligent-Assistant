@@ -79,6 +79,7 @@ func (e *ADKExecutor) Execute(ctx context.Context, task domain.Task, plan domain
 	if err := ensureSession(ctx, e.history, sessionID, task); err != nil {
 		return domain.Task{}, err
 	}
+	artifactContext := loadArtifactContext(task, e.history, sessionID)
 	_ = appendMessage(ctx, e.history, sessionID, "user", task.UserInstruction, "task_input")
 
 	task, err := e.sink.StartAgentRun(ctx, task.TaskID, plan)
@@ -113,10 +114,10 @@ func (e *ADKExecutor) Execute(ctx context.Context, task domain.Task, plan domain
 	}
 
 	planJSON, _ := json.MarshalIndent(plan, "", "  ")
-	log.Println(plan)
+	log.Println("plan: ", plan)
 	iter := agent.Run(ctx, &adk.AgentInput{Messages: []adk.Message{
-		schema.UserMessage(fmt.Sprintf("Task ID: %s\nTitle: %s\nInstruction: %s\nPlan JSON:\n%s\n\nExecute the plan now. Follow dependency order. For document generation, load and follow the document_generation skill before calling doc tools. For slide/PPT generation, load and follow the slide_generation skill before calling slide tools. Call every required plan tool exactly once using the safe tool names described in the system message. Do not invent artifacts.",
-			task.TaskID, task.Title, task.UserInstruction, string(planJSON))),
+		schema.UserMessage(fmt.Sprintf("Task ID: %s\nTitle: %s\nInstruction: %s\nPlan JSON:\n%s\n\nExisting artifact context:\n%s\n\nExecute the plan now. Follow dependency order. For document generation, load and follow the document_generation skill before calling doc tools. For slide/PPT generation, load and follow the slide_generation skill before calling slide tools. For doc_update and slide_regenerate, use the existing artifact context as the baseline and apply the user's latest revision request; do not regenerate from scratch unless the user explicitly asks. Call every required plan tool exactly once using the safe tool names described in the system message. Do not invent artifacts.",
+			task.TaskID, task.Title, task.UserInstruction, string(planJSON), artifactContext.PromptText())),
 	}})
 
 	finalTexts := make([]string, 0)
@@ -189,11 +190,12 @@ func adkSystemPrompt() string {
 	return `You are the execution agent for IM-based Intelligent Assistant.
 Execute the provided plan using Eino tools and Eino skills only. The original plan tool names use dots, while callable tool names use underscores:
 - im.fetch_thread -> im_fetch_thread
-- im.context_summarize -> im_context_summarize
 - doc.create -> doc_create
 - doc.append -> doc_append
 - doc.generate -> doc_generate
+- doc.update -> doc_update
 - slide.generate -> slide_generate
+- slide.regenerate -> slide_regenerate
 - slide.rehearse -> slide_rehearse
 - archive.bundle -> archive_bundle
 - sync.broadcast -> sync_broadcast
@@ -204,8 +206,8 @@ Rules:
 3. Before any doc tool, call skill with skill=document_generation and follow the returned instructions.
 4. Before any slide or PPT tool, call skill with skill=slide_generation and follow the returned instructions.
 5. Pass stepId, original dotted tool name, and description in plan tool arguments.
-6. For doc_create/doc_append/doc_generate, generate the final user-facing Markdown yourself and pass it as content.
-7. For slide_generate, generate the final Slidev Markdown yourself and pass it as slidevMarkdown. For slide_rehearse, generate speaker notes and pass them as speakerNotes.
+6. For doc_create/doc_append/doc_generate/doc_update, generate the final user-facing Markdown yourself and pass it as content. For doc_update, produce the full revised document, not a patch.
+7. For slide_generate/slide_regenerate, generate the final Slidev Markdown yourself and pass it as slidevMarkdown. For slide_rehearse, generate speaker notes and pass them as speakerNotes.
 8. Do not call artifact tools for greeting or status-only tasks.
 9. After tool calls complete, summarize what was produced.`
 }

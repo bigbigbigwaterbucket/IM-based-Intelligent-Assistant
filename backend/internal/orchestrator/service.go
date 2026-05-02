@@ -26,6 +26,13 @@ type CreateTaskInput struct {
 	MessageID   string `json:"messageId"`
 }
 
+type ContinueTaskInput struct {
+	SessionID   string `json:"sessionId"`
+	Instruction string `json:"instruction"`
+	MessageID   string `json:"messageId"`
+	ActorType   string `json:"actorType"`
+}
+
 type ActionInput struct {
 	ActionType string `json:"actionType"`
 	ActorType  string `json:"actorType"`
@@ -73,20 +80,21 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (domain
 
 	now := time.Now()
 	task := domain.Task{
-		TaskID:          uuid.NewString(),
-		Title:           input.Title,
-		UserInstruction: input.Instruction,
-		Source:          fallback(input.Source, "desktop"),
-		ChatID:          input.ChatID,
-		ThreadID:        input.ThreadID,
-		MessageID:       input.MessageID,
-		Status:          domain.StatusCreated,
-		CurrentStep:     "created",
-		ProgressText:    "任务已创建，等待规划",
-		Version:         1,
-		LastActor:       "desktop",
-		CreatedAt:       now,
-		UpdatedAt:       now,
+		TaskID:            uuid.NewString(),
+		Title:             input.Title,
+		UserInstruction:   input.Instruction,
+		Source:            fallback(input.Source, "desktop"),
+		ChatID:            input.ChatID,
+		ThreadID:          input.ThreadID,
+		MessageID:         input.MessageID,
+		Status:            domain.StatusCreated,
+		CurrentStep:       "created",
+		ProgressText:      "任务已创建，等待规划",
+		Version:           1,
+		LastActor:         fallback(input.Source, "desktop"),
+		LastInteractionAt: &now,
+		CreatedAt:         now,
+		UpdatedAt:         now,
 		Steps: []domain.Step{
 			newStep("capture", "任务创建", domain.StepCompleted, "来自桌面端手动创建"),
 		},
@@ -96,9 +104,56 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (domain
 	if err != nil {
 		return domain.Task{}, err
 	}
+	_ = s.upsertSession(ctx, sessionIDForTask(task), task)
 	s.hub.Broadcast("task.created", task.TaskID, task.Version, task)
 
 	go s.runTask(context.Background(), task.TaskID)
+	return task, nil
+}
+
+func (s *Service) ContinueTask(ctx context.Context, input ContinueTaskInput) (domain.Task, error) {
+	if strings.TrimSpace(input.SessionID) == "" {
+		return domain.Task{}, errors.New("session id is required")
+	}
+	revision := strings.TrimSpace(input.Instruction)
+	if revision == "" {
+		return domain.Task{}, errors.New("instruction is required")
+	}
+
+	repo, ok := s.store.(store.ActiveTaskRepository)
+	if !ok {
+		return domain.Task{}, errors.New("active task lookup is not available")
+	}
+	task, err := repo.FindActiveTaskBySession(ctx, input.SessionID)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	if task.Status == domain.StatusCreated || task.Status == domain.StatusPlanning || task.Status == domain.StatusExecuting {
+		return domain.Task{}, errors.New("task is still running; wait for the current run to finish")
+	}
+
+	now := time.Now()
+	originalInstruction := task.UserInstruction
+	task = s.updateTask(ctx, task, func(current *domain.Task) {
+		current.UserInstruction = revisionInstruction(originalInstruction, revision)
+		current.MessageID = fallback(input.MessageID, current.MessageID)
+		current.Status = domain.StatusPlanning
+		current.RequiresAction = false
+		current.ErrorMessage = ""
+		current.CurrentStep = "revision_planning"
+		current.ProgressText = "Applying revision request"
+		current.LastActor = fallback(input.ActorType, "user")
+		current.LastInteractionAt = &now
+		current.IdlePromptedAt = nil
+		current.Steps = append(current.Steps, newStep("revision_request", "Revision request", domain.StepCompleted, revision))
+	})
+	if task.TaskID == "" {
+		return domain.Task{}, errors.New("task state update failed")
+	}
+	_ = s.upsertSession(ctx, input.SessionID, task)
+
+	plan := buildRevisionPlan(task, revision)
+	go s.runPreparedPlan(context.Background(), task.TaskID, plan)
 	return task, nil
 }
 
@@ -147,9 +202,52 @@ func (s *Service) SubmitAction(ctx context.Context, taskID string, input ActionI
 		s.hub.Broadcast("action.resolved", task.TaskID, task.Version, task)
 		go s.finishTask(context.Background(), task.TaskID)
 		return task, nil
+	case string(domain.ActionEndTask):
+		if task.Status != domain.StatusWaitingAction {
+			return domain.Task{}, errors.New("only waiting tasks can be ended")
+		}
+		return s.endTask(ctx, task, fallback(input.ActorType, "user"), "Task ended by user")
 	default:
 		return domain.Task{}, errors.New("unsupported action")
 	}
+}
+
+func (s *Service) EndActiveTask(ctx context.Context, sessionID, actorType string) (domain.Task, error) {
+	repo, ok := s.store.(store.ActiveTaskRepository)
+	if !ok {
+		return domain.Task{}, errors.New("active task lookup is not available")
+	}
+	task, err := repo.FindActiveTaskBySession(ctx, sessionID)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	return s.endTask(ctx, task, fallback(actorType, "user"), "Task ended by /assistant new")
+}
+
+func (s *Service) ListIdleWaitingTasks(ctx context.Context, idleFor time.Duration) ([]domain.Task, error) {
+	repo, ok := s.store.(store.ActiveTaskRepository)
+	if !ok {
+		return nil, errors.New("idle task lookup is not available")
+	}
+	if idleFor <= 0 {
+		idleFor = 30 * time.Minute
+	}
+	return repo.ListIdleWaitingTasks(ctx, time.Now().Add(-idleFor))
+}
+
+func (s *Service) MarkIdlePrompted(ctx context.Context, taskID string) (domain.Task, error) {
+	task, err := s.store.Get(ctx, taskID)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	now := time.Now()
+	task = s.updateTask(ctx, task, func(current *domain.Task) {
+		current.IdlePromptedAt = &now
+	})
+	if task.TaskID == "" {
+		return domain.Task{}, errors.New("task state update failed")
+	}
+	return task, nil
 }
 
 func (s *Service) GetTask(ctx context.Context, taskID string) (domain.Task, error) {
@@ -172,7 +270,7 @@ func (s *Service) WaitTaskDone(ctx context.Context, taskID string, timeout, inte
 		if err != nil {
 			return domain.Task{}, err
 		}
-		if task.Status == domain.StatusCompleted || task.Status == domain.StatusFailed {
+		if task.Status == domain.StatusCompleted || task.Status == domain.StatusWaitingAction || task.Status == domain.StatusFailed {
 			return task, nil
 		}
 
@@ -226,6 +324,19 @@ func (s *Service) runTask(ctx context.Context, taskID string) {
 	s.hub.Broadcast("artifact.updated", taskID, task.Version, task)
 }
 
+func (s *Service) runPreparedPlan(ctx context.Context, taskID string, plan domain.Plan) {
+	task, err := s.store.Get(ctx, taskID)
+	if err != nil {
+		return
+	}
+	task, err = s.executor.Execute(ctx, task, plan)
+	if err != nil {
+		s.failTask(ctx, taskID, err.Error(), true)
+		return
+	}
+	s.hub.Broadcast("artifact.updated", taskID, task.Version, task)
+}
+
 func (s *Service) executePlan(ctx context.Context, task domain.Task, plan domain.Plan) (domain.Task, error) {
 	var contextResult tools.Result
 	var docResult tools.Result
@@ -255,12 +366,9 @@ func (s *Service) executePlan(ctx context.Context, task domain.Task, plan domain
 
 		task = s.updateTask(ctx, task, func(current *domain.Task) {
 			completeLatestStep(current)
-			if docResult.ArtifactURL != "" {
-				current.DocURL = docResult.ArtifactURL
-			}
-			if slidesResult.ArtifactURL != "" {
-				current.SlidesURL = slidesResult.ArtifactURL
-			}
+			applyToolResult(current, docResult)
+			applyToolResult(current, slidesResult)
+			applyToolResult(current, result)
 			current.ProgressText = result.PayloadSummary
 		})
 		s.hub.Broadcast("artifact.updated", task.TaskID, task.Version, task)
@@ -276,7 +384,7 @@ func (s *Service) executePlan(ctx context.Context, task domain.Task, plan domain
 
 func (s *Service) runToolStep(ctx context.Context, task domain.Task, plan domain.Plan, step domain.PlanStep, contextResult, docResult, slidesResult *tools.Result, docGenerated, slidesGenerated *bool) tools.Result {
 	switch step.Tool {
-	case "im.fetch_thread", "im.context_summarize":
+	case "im.fetch_thread":
 		*contextResult = s.tools.FetchThread(ctx, task, step)
 		return *contextResult
 	case "doc.create", "doc.append", "doc.generate":
@@ -286,11 +394,19 @@ func (s *Service) runToolStep(ctx context.Context, task domain.Task, plan domain
 		*docResult = s.tools.CreateDoc(ctx, plan, task.UserInstruction, *contextResult, "")
 		*docGenerated = docResult.Success
 		return *docResult
+	case "doc.update":
+		*docResult = s.tools.UpdateDoc(ctx, task, plan, task.UserInstruction, "")
+		*docGenerated = docResult.Success
+		return *docResult
 	case "slide.generate":
 		if *slidesGenerated {
 			return s.tools.CompleteStep(step)
 		}
 		*slidesResult = s.tools.CreateSlides(ctx, plan, "", "")
+		*slidesGenerated = slidesResult.Success
+		return *slidesResult
+	case "slide.regenerate":
+		*slidesResult = s.tools.RegenerateSlides(ctx, task, plan, "", "")
 		*slidesGenerated = slidesResult.Success
 		return *slidesResult
 	case "slide.rehearse":
@@ -352,14 +468,7 @@ func (s *Service) CompleteToolStep(ctx context.Context, taskID string, result to
 	}
 	task = s.updateTask(ctx, task, func(current *domain.Task) {
 		completeLatestStep(current)
-		if result.ArtifactURL != "" {
-			switch {
-			case strings.HasPrefix(result.StepName, "doc."):
-				current.DocURL = result.ArtifactURL
-			case strings.HasPrefix(result.StepName, "slide."):
-				current.SlidesURL = result.ArtifactURL
-			}
-		}
+		applyToolResult(current, result)
 		if result.PayloadSummary != "" {
 			current.ProgressText = result.PayloadSummary
 		}
@@ -399,10 +508,18 @@ func (s *Service) CompleteAgentRun(ctx context.Context, taskID string, plan doma
 			completeLatestStep(current)
 		}
 		current.ProgressText = completionText(*current)
-		current.CurrentStep = "completed"
-		current.Status = domain.StatusCompleted
 		current.Summary = plan.Summary
-		current.RequiresAction = false
+		if current.DocURL != "" || current.SlidesURL != "" {
+			now := time.Now()
+			current.CurrentStep = "awaiting_feedback"
+			current.Status = domain.StatusWaitingAction
+			current.RequiresAction = true
+			current.LastInteractionAt = &now
+		} else {
+			current.CurrentStep = "completed"
+			current.Status = domain.StatusCompleted
+			current.RequiresAction = false
+		}
 	})
 	if task.TaskID == "" {
 		return domain.Task{}, errors.New("task state update failed")
@@ -421,6 +538,22 @@ func (s *Service) finishTask(ctx context.Context, taskID string) {
 		current.ProgressText = "任务经人工确认后完成"
 	})
 	_ = task
+}
+
+func (s *Service) endTask(ctx context.Context, task domain.Task, actorType, summary string) (domain.Task, error) {
+	task = s.updateTask(ctx, task, func(current *domain.Task) {
+		current.Status = domain.StatusCompleted
+		current.CurrentStep = "completed"
+		current.RequiresAction = false
+		current.ProgressText = summary
+		current.LastActor = actorType
+		current.Steps = append(current.Steps, newStep("end_task", "End task", domain.StepCompleted, summary))
+	})
+	if task.TaskID == "" {
+		return domain.Task{}, errors.New("task state update failed")
+	}
+	s.hub.Broadcast("action.resolved", task.TaskID, task.Version, task)
+	return task, nil
 }
 
 func (s *Service) failTask(ctx context.Context, taskID, message string, requiresAction bool) {
@@ -472,6 +605,136 @@ func newStep(id, name string, status domain.StepStatus, summary string) domain.S
 	return step
 }
 
+func (s *Service) upsertSession(ctx context.Context, sessionID string, task domain.Task) error {
+	history, ok := s.store.(store.HistoryRepository)
+	if !ok || strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	now := time.Now()
+	return history.UpsertSession(ctx, domain.Session{
+		SessionID: sessionID,
+		TaskID:    task.TaskID,
+		ChatID:    task.ChatID,
+		ThreadID:  task.ThreadID,
+		CreatedAt: now,
+		UpdatedAt: now,
+	})
+}
+
+func applyToolResult(task *domain.Task, result tools.Result) {
+	if result.StepName == "" {
+		return
+	}
+	if result.ArtifactURL != "" {
+		switch {
+		case strings.HasPrefix(result.StepName, "doc."):
+			task.DocURL = result.ArtifactURL
+		case strings.HasPrefix(result.StepName, "slide."):
+			task.SlidesURL = result.ArtifactURL
+		}
+	}
+	if result.ArtifactPath != "" {
+		switch {
+		case strings.HasPrefix(result.StepName, "doc."):
+			task.DocArtifactPath = result.ArtifactPath
+		case result.StepName == "slide.generate" || result.StepName == "slide.regenerate":
+			task.SlidesArtifactPath = result.ArtifactPath
+		}
+	}
+	if result.Data == nil {
+		return
+	}
+	if docID := result.Data["feishu_document_id"]; docID != "" {
+		task.DocID = docID
+	}
+	if path := result.Data["local_path"]; path != "" && strings.HasPrefix(result.StepName, "doc.") {
+		task.DocArtifactPath = path
+	}
+}
+
+func revisionInstruction(original, revision string) string {
+	original = strings.TrimSpace(original)
+	revision = strings.TrimSpace(revision)
+	if original == "" {
+		return revision
+	}
+	return original + "\n\nRevision request: " + revision
+}
+
+func buildRevisionPlan(task domain.Task, instruction string) domain.Plan {
+	steps := []domain.PlanStep{
+		{ID: "r1", Tool: "intent.analyze", Description: "Analyze revision request"},
+	}
+	deps := []string{"r1"}
+	if task.DocURL != "" || task.DocID != "" {
+		steps = append(steps, domain.PlanStep{
+			ID:          "r2",
+			Tool:        "doc.update",
+			Description: "Update existing Feishu Docx content in place",
+			DependsOn:   deps,
+			Args:        map[string]any{"revision": instruction},
+		})
+		deps = []string{"r2"}
+	}
+	if task.SlidesURL != "" {
+		slideID := fmt.Sprintf("r%d", len(steps)+1)
+		steps = append(steps, domain.PlanStep{
+			ID:          slideID,
+			Tool:        "slide.regenerate",
+			Description: "Regenerate Slidev presentation from the revised document direction",
+			DependsOn:   deps,
+			Args:        map[string]any{"revision": instruction},
+		})
+		deps = []string{slideID}
+	}
+	if len(steps) == 1 {
+		steps = append(steps, domain.PlanStep{
+			ID:          "r2",
+			Tool:        "sync.broadcast",
+			Description: "Record revision request without artifact changes",
+			DependsOn:   deps,
+		})
+	}
+	return domain.Plan{
+		Summary:       "Apply user revision to existing task artifacts.",
+		PlannerSource: "revision",
+		Analysis: domain.IntentAnalysis{
+			Objective:    "Revise existing task artifacts based on user feedback.",
+			Audience:     "Existing task reviewers",
+			Deliverables: revisionDeliverables(task),
+		},
+		Steps:      steps,
+		DocTitle:   task.Title,
+		SlideTitle: task.Title,
+		DocumentSections: []domain.DocumentSection{{
+			Heading: "Revision request",
+			Bullets: []string{instruction},
+		}},
+		Slides: []domain.Slide{{
+			Title:   task.Title,
+			Bullets: []string{instruction},
+		}},
+	}
+}
+
+func revisionDeliverables(task domain.Task) []string {
+	var deliverables []string
+	if task.DocURL != "" || task.DocID != "" {
+		deliverables = append(deliverables, "document")
+	}
+	if task.SlidesURL != "" {
+		deliverables = append(deliverables, "slides")
+	}
+	return deliverables
+}
+
+func sessionIDForTask(task domain.Task) string {
+	if task.ChatID != "" {
+		return "chat:" + task.ChatID
+	}
+	return "task:" + task.TaskID
+}
+
 func completeLatestStep(task *domain.Task) {
 	if len(task.Steps) == 0 {
 		return
@@ -517,7 +780,11 @@ func isLogicalStep(tool string) bool {
 
 func toolDisplayName(tool string) string {
 	switch tool {
-	case "im.fetch_thread", "im.context_summarize":
+	case "doc.update":
+		return "Update document"
+	case "slide.regenerate":
+		return "Regenerate slides"
+	case "im.fetch_thread":
 		return "读取 IM 上下文"
 	case "doc.create":
 		return "创建文档"

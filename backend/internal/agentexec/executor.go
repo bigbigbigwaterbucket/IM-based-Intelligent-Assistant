@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -57,6 +58,7 @@ func (e *PlanExecutor) Execute(ctx context.Context, task domain.Task, plan domai
 	if err := e.ensureSession(ctx, sessionID, task); err != nil {
 		return domain.Task{}, err
 	}
+	artifactContext := loadArtifactContext(task, e.history, sessionID)
 	_ = e.appendMessage(ctx, sessionID, "user", task.UserInstruction, "task_input")
 
 	task, err := e.sink.StartAgentRun(ctx, task.TaskID, plan)
@@ -74,12 +76,14 @@ func (e *PlanExecutor) Execute(ctx context.Context, task domain.Task, plan domai
 		if !ok {
 			continue
 		}
-		args, err := json.Marshal(stepToolInput{
+		input := stepToolInput{
 			StepID:      step.ID,
 			Tool:        step.Tool,
 			Description: step.Description,
 			Args:        step.Args,
-		})
+		}
+		enrichStepInputWithContext(&input, step.Tool, artifactContext)
+		args, err := json.Marshal(input)
 		if err != nil {
 			return task, err
 		}
@@ -189,15 +193,16 @@ func newToolSet(runner *tools.Runner, sink ProgressSink, history store.HistoryRe
 	}
 
 	byPlanName := map[string]tool.InvokableTool{
-		"im.fetch_thread":      wrap("im.fetch_thread", "Read IM context", "Read and summarize Feishu IM thread context for the task."),
-		"im.context_summarize": wrap("im.context_summarize", "Read IM context", "Read and summarize Feishu IM thread context for the task."),
-		"doc.create":           wrap("doc.create", "Create document", "Create the task document artifact."),
-		"doc.append":           wrap("doc.append", "Append document", "Append structured content to the task document artifact."),
-		"doc.generate":         wrap("doc.generate", "Generate document", "Generate the task document artifact."),
-		"slide.generate":       wrap("slide.generate", "Generate slides", "Generate the task Slidev presentation artifact."),
-		"slide.rehearse":       wrap("slide.rehearse", "Generate speaker notes", "Generate or confirm speaker notes for the slides."),
-		"archive.bundle":       wrap("archive.bundle", "Bundle artifacts", "Bundle task artifacts into a manifest."),
-		"sync.broadcast":       wrap("sync.broadcast", "Broadcast status", "Broadcast task status without creating artifacts."),
+		"im.fetch_thread":  wrap("im.fetch_thread", "Read IM context", "Read and summarize Feishu IM thread context for the task."),
+		"doc.create":       wrap("doc.create", "Create document", "Create the task document artifact."),
+		"doc.append":       wrap("doc.append", "Append document", "Append structured content to the task document artifact."),
+		"doc.generate":     wrap("doc.generate", "Generate document", "Generate the task document artifact."),
+		"doc.update":       wrap("doc.update", "Update document", "Update the existing task document artifact in place when possible."),
+		"slide.generate":   wrap("slide.generate", "Generate slides", "Generate the task Slidev presentation artifact."),
+		"slide.regenerate": wrap("slide.regenerate", "Regenerate slides", "Regenerate the task Slidev presentation artifact."),
+		"slide.rehearse":   wrap("slide.rehearse", "Generate speaker notes", "Generate or confirm speaker notes for the slides."),
+		"archive.bundle":   wrap("archive.bundle", "Bundle artifacts", "Bundle task artifacts into a manifest."),
+		"sync.broadcast":   wrap("sync.broadcast", "Broadcast status", "Broadcast task status without creating artifacts."),
 	}
 	tools := make([]tool.BaseTool, 0, len(byPlanName))
 	seen := make(map[string]struct{}, len(byPlanName))
@@ -281,7 +286,7 @@ func (t *executionTool) InvokableRun(ctx context.Context, argumentsInJSON string
 
 func (t *executionTool) execute(ctx context.Context, step domain.PlanStep, input stepToolInput) tools.Result {
 	switch step.Tool {
-	case "im.fetch_thread", "im.context_summarize":
+	case "im.fetch_thread":
 		t.state.contextResult = t.runner.FetchThread(ctx, t.task, step)
 		return t.state.contextResult
 	case "doc.create", "doc.append", "doc.generate":
@@ -291,11 +296,19 @@ func (t *executionTool) execute(ctx context.Context, step domain.PlanStep, input
 		t.state.docResult = t.runner.CreateDoc(ctx, t.plan, t.task.UserInstruction, t.state.contextResult, input.documentContent())
 		t.state.docGenerated = t.state.docResult.Success
 		return t.state.docResult
+	case "doc.update":
+		t.state.docResult = t.runner.UpdateDoc(ctx, t.task, t.plan, t.task.UserInstruction, input.documentContent())
+		t.state.docGenerated = t.state.docResult.Success
+		return t.state.docResult
 	case "slide.generate":
 		if t.state.slidesGenerated {
 			return t.runner.CompleteStep(step)
 		}
 		t.state.slidesResult = t.runner.CreateSlides(ctx, t.plan, input.slidevContent(), input.speakerNotesContent())
+		t.state.slidesGenerated = t.state.slidesResult.Success
+		return t.state.slidesResult
+	case "slide.regenerate":
+		t.state.slidesResult = t.runner.RegenerateSlides(ctx, t.task, t.plan, input.slidevContent(), input.speakerNotesContent())
 		t.state.slidesGenerated = t.state.slidesResult.Success
 		return t.state.slidesResult
 	case "slide.rehearse":
@@ -338,7 +351,102 @@ type stepToolInput struct {
 	Markdown       string         `json:"markdown,omitempty"`
 	SlidevMarkdown string         `json:"slidevMarkdown,omitempty"`
 	SpeakerNotes   string         `json:"speakerNotes,omitempty"`
+	ExistingDoc    string         `json:"existingDocument,omitempty"`
+	ExistingSlides string         `json:"existingSlides,omitempty"`
+	RecentHistory  string         `json:"recentHistory,omitempty"`
 	Args           map[string]any `json:"args,omitempty"`
+}
+
+type artifactContext struct {
+	Document string
+	Slides   string
+	History  string
+}
+
+func (c artifactContext) PromptText() string {
+	parts := make([]string, 0, 3)
+	if strings.TrimSpace(c.Document) != "" {
+		parts = append(parts, "Existing document Markdown:\n"+c.Document)
+	}
+	if strings.TrimSpace(c.Slides) != "" {
+		parts = append(parts, "Existing Slidev Markdown:\n"+c.Slides)
+	}
+	if strings.TrimSpace(c.History) != "" {
+		parts = append(parts, "Recent conversation:\n"+c.History)
+	}
+	if len(parts) == 0 {
+		return "(none)"
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+func loadArtifactContext(task domain.Task, history store.HistoryRepository, sessionID string) artifactContext {
+	return artifactContext{
+		Document: readContextFile(task.DocArtifactPath, 24000),
+		Slides:   readContextFile(task.SlidesArtifactPath, 24000),
+		History:  recentConversationText(history, sessionID, 12, 12000),
+	}
+}
+
+func readContextFile(path string, maxBytes int) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	text := string(data)
+	if maxBytes > 0 && len(text) > maxBytes {
+		return text[:maxBytes] + fmt.Sprintf("\n\n...<truncated %d bytes>", len(text)-maxBytes)
+	}
+	return text
+}
+
+func recentConversationText(history store.HistoryRepository, sessionID string, limit int, maxBytes int) string {
+	if history == nil || strings.TrimSpace(sessionID) == "" {
+		return ""
+	}
+	messages, err := history.ListMessages(context.Background(), sessionID, limit)
+	if err != nil {
+		return ""
+	}
+	lines := make([]string, 0, len(messages))
+	for _, message := range messages {
+		content := strings.TrimSpace(message.Content)
+		if content == "" {
+			continue
+		}
+		lines = append(lines, message.Role+": "+content)
+	}
+	text := strings.Join(lines, "\n")
+	if maxBytes > 0 && len(text) > maxBytes {
+		return text[len(text)-maxBytes:]
+	}
+	return text
+}
+
+func enrichStepInputWithContext(input *stepToolInput, tool string, context artifactContext) {
+	if input == nil {
+		return
+	}
+	switch tool {
+	case "doc.update":
+		if strings.TrimSpace(input.ExistingDoc) == "" {
+			input.ExistingDoc = context.Document
+		}
+		input.RecentHistory = context.History
+	case "slide.regenerate":
+		if strings.TrimSpace(input.ExistingSlides) == "" {
+			input.ExistingSlides = context.Slides
+		}
+		input.RecentHistory = context.History
+	}
 }
 
 func (i stepToolInput) documentContent() string {
@@ -440,8 +548,6 @@ func limitLogText(text string, max int) string {
 
 func sessionIDForTask(task domain.Task) string {
 	switch {
-	case task.ChatID != "" && task.ThreadID != "":
-		return "thread:" + task.ChatID + ":" + task.ThreadID
 	case task.ChatID != "":
 		return "chat:" + task.ChatID
 	default:
@@ -502,13 +608,13 @@ func toolInfo(name, description, planName string) *schema.ToolInfo {
 	}
 
 	switch planName {
-	case "doc.create", "doc.append", "doc.generate":
+	case "doc.create", "doc.append", "doc.generate", "doc.update":
 		params["content"] = &schema.ParameterInfo{
 			Type:     schema.String,
-			Desc:     "Complete Markdown document content to persist. Generate this from the task instruction, plan, and fetched IM context; do not leave it empty.",
+			Desc:     "Complete Markdown document content to persist. For updates, provide the full revised document content.",
 			Required: true,
 		}
-	case "slide.generate":
+	case "slide.generate", "slide.regenerate":
 		params["slidevMarkdown"] = &schema.ParameterInfo{
 			Type:     schema.String,
 			Desc:     "Complete Slidev Markdown presentation content to persist. Include frontmatter and all slides.",
@@ -547,7 +653,7 @@ func isLogicalStep(tool string) bool {
 
 func planNeedsDoc(plan domain.Plan) bool {
 	for _, step := range plan.Steps {
-		if step.Tool == "doc.create" || step.Tool == "doc.append" || step.Tool == "doc.generate" {
+		if step.Tool == "doc.create" || step.Tool == "doc.append" || step.Tool == "doc.generate" || step.Tool == "doc.update" {
 			return true
 		}
 	}
@@ -556,7 +662,7 @@ func planNeedsDoc(plan domain.Plan) bool {
 
 func planNeedsSlides(plan domain.Plan) bool {
 	for _, step := range plan.Steps {
-		if step.Tool == "slide.generate" || step.Tool == "slide.rehearse" {
+		if step.Tool == "slide.generate" || step.Tool == "slide.regenerate" || step.Tool == "slide.rehearse" {
 			return true
 		}
 	}

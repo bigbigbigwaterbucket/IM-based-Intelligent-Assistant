@@ -3,6 +3,7 @@ package larkbot
 import (
 	"context"
 	"log"
+	"time"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
@@ -32,7 +33,8 @@ func New(config Config, launcher TaskLauncher) (*Bot, error) {
 	}
 
 	eventHandler := dispatcher.NewEventDispatcher(config.VerificationToken, config.EventEncryptKey).
-		OnP2MessageReceiveV1(handler.HandleMessage)
+		OnP2MessageReceiveV1(handler.HandleMessage).
+		OnP2CardActionTrigger(handler.HandleCardAction)
 	wsClient := larkws.NewClient(
 		config.AppID,
 		config.AppSecret,
@@ -56,6 +58,19 @@ func (b *Bot) Start(ctx context.Context) {
 		log.Printf("feishu bot websocket starting")
 		if err := b.wsClient.Start(ctx); err != nil {
 			log.Printf("feishu bot websocket stopped: %v", err)
+		}
+	}()
+
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				b.handler.PromptIdleTasks(ctx, 2*time.Minute)
+			}
 		}
 	}()
 }

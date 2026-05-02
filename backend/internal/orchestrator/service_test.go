@@ -51,7 +51,7 @@ func TestCreateTaskCompletesPipeline(t *testing.T) {
 		if err != nil {
 			return false
 		}
-		return latest.Status == domain.StatusCompleted
+		return latest.Status == domain.StatusWaitingAction
 	})
 
 	latest, err := taskStore.Get(context.Background(), task.TaskID)
@@ -61,6 +61,12 @@ func TestCreateTaskCompletesPipeline(t *testing.T) {
 
 	if latest.DocURL == "" {
 		t.Fatal("expected doc url to be set")
+	}
+	if latest.Status != domain.StatusWaitingAction {
+		t.Fatalf("expected waiting action status, got %s", latest.Status)
+	}
+	if !latest.RequiresAction {
+		t.Fatal("expected task to require action while awaiting feedback")
 	}
 	if latest.SlidesURL == "" {
 		t.Fatal("expected slides url to be set")

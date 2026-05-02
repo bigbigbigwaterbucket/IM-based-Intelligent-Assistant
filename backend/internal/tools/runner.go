@@ -233,6 +233,85 @@ func (r *Runner) CreateSlides(ctx context.Context, plan domain.Plan, slidevMarkd
 	}
 }
 
+func (r *Runner) UpdateDoc(ctx context.Context, task domain.Task, plan domain.Plan, instruction string, generatedMarkdown string) Result {
+	if err := os.MkdirAll(r.config.ArtifactDir, 0755); err != nil {
+		return failed("doc.update", err)
+	}
+
+	fileName := fmt.Sprintf("doc_revision_%s.md", artifactID())
+	path := filepath.Join(r.config.ArtifactDir, fileName)
+	content := strings.TrimSpace(generatedMarkdown)
+	contentSource := "agent_markdown"
+	if content == "" {
+		content = appendRevisionToExisting(task.DocArtifactPath, instruction)
+		if content == "" {
+			content = renderDocument(plan, instruction, Result{})
+		}
+		contentSource = "planner_fallback"
+	}
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		return failed("doc.update", err)
+	}
+
+	result := Result{
+		Success:        true,
+		StepName:       "doc.update",
+		PayloadSummary: fmt.Sprintf("Generated revised Markdown document: %s", path),
+		ArtifactURL:    task.DocURL,
+		ArtifactPath:   path,
+		Data: map[string]string{
+			"source":         "local_markdown",
+			"content_source": contentSource,
+			"local_path":     path,
+		},
+	}
+	if result.ArtifactURL == "" {
+		result.ArtifactURL = "/artifacts/" + fileName
+	}
+
+	if !r.config.EnableFeishuTools {
+		return result
+	}
+	docID := strings.TrimSpace(task.DocID)
+	if docID == "" {
+		url, createdDocID, err := r.createFeishuDoc(ctx, fallbackTitle(plan.DocTitle, task.Title), content)
+		if err != nil {
+			result.Data["feishu_error"] = err.Error()
+			return result
+		}
+		result.Data["source"] = "feishu_docx"
+		result.Data["feishu_document_id"] = createdDocID
+		if url != "" {
+			result.ArtifactURL = url
+		}
+		result.PayloadSummary = "Created Feishu Docx for revised document: " + result.ArtifactURL
+		return result
+	}
+	if err := r.replaceFeishuDoc(ctx, docID, content); err != nil {
+		result.Data["feishu_error"] = err.Error()
+		return result
+	}
+	result.Data["source"] = "feishu_docx"
+	result.Data["feishu_document_id"] = docID
+	if result.ArtifactURL == "" || strings.HasPrefix(result.ArtifactURL, "/artifacts/") {
+		result.ArtifactURL = r.documentURL(docID)
+	}
+	result.PayloadSummary = "Updated Feishu Docx in place: " + result.ArtifactURL
+	return result
+}
+
+func (r *Runner) RegenerateSlides(ctx context.Context, task domain.Task, plan domain.Plan, slidevMarkdown, speakerNotes string) Result {
+	if strings.TrimSpace(slidevMarkdown) == "" {
+		slidevMarkdown = appendRevisionToExisting(task.SlidesArtifactPath, plan.Summary)
+	}
+	result := r.CreateSlides(ctx, plan, slidevMarkdown, speakerNotes)
+	result.StepName = "slide.regenerate"
+	if result.Success {
+		result.PayloadSummary = "Regenerated Slidev presentation: " + result.ArtifactPath
+	}
+	return result
+}
+
 func (r *Runner) CreateSpeakerNotes(ctx context.Context, plan domain.Plan, speakerNotes string, slidesResult Result) Result {
 	if err := os.MkdirAll(r.config.ArtifactDir, 0755); err != nil {
 		return failed("slide.rehearse", err)
@@ -409,6 +488,70 @@ func (r *Runner) appendFeishuDocBlocks(ctx context.Context, docID string, firstL
 		}
 	}
 	return nil
+}
+
+func (r *Runner) replaceFeishuDoc(ctx context.Context, docID string, markdown string) error {
+	if r.client == nil {
+		return errors.New("Feishu SDK client is not configured")
+	}
+	childIDs, err := r.listRootBlockIDs(ctx, docID)
+	if err != nil {
+		return err
+	}
+	if len(childIDs) > 0 {
+		deleteReq := larkdocx.NewBatchDeleteDocumentBlockChildrenReqBuilder().
+			DocumentId(docID).
+			BlockId(docID).
+			DocumentRevisionId(-1).
+			Body(larkdocx.NewBatchDeleteDocumentBlockChildrenReqBodyBuilder().
+				StartIndex(0).
+				EndIndex(len(childIDs)).
+				Build()).
+			Build()
+		deleteResp, err := r.client.Docx.V1.DocumentBlockChildren.BatchDelete(ctx, deleteReq)
+		if err != nil {
+			return err
+		}
+		if deleteResp == nil {
+			return errors.New("empty Feishu Docx delete response")
+		}
+		if !deleteResp.Success() {
+			return fmt.Errorf("Feishu Docx delete failed: code=%d msg=%s request_id=%s", deleteResp.Code, deleteResp.Msg, deleteResp.RequestId())
+		}
+	}
+
+	firstLevelBlockIDs, descendants, err := r.convertMarkdownToDocxBlocks(ctx, markdown)
+	if err != nil {
+		return err
+	}
+	return r.appendFeishuDocBlocks(ctx, docID, firstLevelBlockIDs, descendants)
+}
+
+func (r *Runner) listRootBlockIDs(ctx context.Context, docID string) ([]string, error) {
+	req := larkdocx.NewGetDocumentBlockChildrenReqBuilder().
+		DocumentId(docID).
+		BlockId(docID).
+		DocumentRevisionId(-1).
+		PageSize(500).
+		Build()
+	iterator, err := r.client.Docx.V1.DocumentBlockChildren.GetByIterator(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for {
+		ok, block, err := iterator.Next()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		if block != nil && block.BlockId != nil && *block.BlockId != "" {
+			ids = append(ids, *block.BlockId)
+		}
+	}
+	return ids, nil
 }
 
 type feishuDocBlockChunk struct {
@@ -925,6 +1068,33 @@ func fallbackText(value, defaultValue string) string {
 		return defaultValue
 	}
 	return value
+}
+
+func fallbackTitle(value, defaultValue string) string {
+	if strings.TrimSpace(value) == "" {
+		return strings.TrimSpace(defaultValue)
+	}
+	return value
+}
+
+func appendRevisionToExisting(path string, instruction string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	content := strings.TrimSpace(string(data))
+	if content == "" {
+		return ""
+	}
+	instruction = strings.TrimSpace(instruction)
+	if instruction == "" {
+		return content
+	}
+	return content + "\n\n## Revision request\n\n" + instruction + "\n"
 }
 
 func stringValue(value *string) string {

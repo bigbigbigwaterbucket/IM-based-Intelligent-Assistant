@@ -9,11 +9,13 @@ import (
 const AssistantCommand = "assistant_run"
 
 var atTagPattern = regexp.MustCompile(`(?is)<at\b[^>]*>.*?</at>`)
+var leadingMentionPattern = regexp.MustCompile(`(?i)^(?:@\S+\s+)+`)
 
 type Command struct {
 	Name   string
 	Intent string
 	Help   bool
+	New    bool
 }
 
 func ParseTextContent(messageType, content string) (Command, bool) {
@@ -43,7 +45,13 @@ func ParseCommandText(text string) (Command, bool) {
 		}
 		if strings.HasPrefix(lower, prefix+" ") || strings.HasPrefix(lower, prefix+"\n") || strings.HasPrefix(lower, prefix+"\t") {
 			intent := strings.TrimSpace(text[len(prefix):])
-			return Command{Name: AssistantCommand, Intent: intent, Help: intent == ""}, true
+			cmd := Command{Name: AssistantCommand, Intent: intent, Help: intent == ""}
+			if strings.EqualFold(intent, "new") || strings.HasPrefix(strings.ToLower(intent), "new ") {
+				cmd.New = true
+				cmd.Intent = strings.TrimSpace(intent[len("new"):])
+				cmd.Help = false
+			}
+			return cmd, true
 		}
 	}
 
@@ -52,5 +60,6 @@ func ParseCommandText(text string) (Command, bool) {
 
 func normalizeCommandText(text string) string {
 	text = atTagPattern.ReplaceAllString(text, " ")
+	text = leadingMentionPattern.ReplaceAllString(strings.TrimSpace(text), "")
 	return strings.TrimSpace(strings.Join(strings.Fields(text), " "))
 }

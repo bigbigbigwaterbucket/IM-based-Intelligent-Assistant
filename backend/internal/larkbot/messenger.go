@@ -15,6 +15,7 @@ import (
 type TextMessenger interface {
 	ReplyText(ctx context.Context, messageID, text string) error
 	SendText(ctx context.Context, receiveID, idType, text string) error
+	SendInteractive(ctx context.Context, receiveID, idType, content string) error
 }
 
 type SDKMessenger struct {
@@ -89,6 +90,41 @@ func (m *SDKMessenger) SendText(ctx context.Context, receiveID, idType, text str
 	}
 	if !resp.Success() {
 		return fmt.Errorf("send text failed: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	return nil
+}
+
+func (m *SDKMessenger) SendInteractive(ctx context.Context, receiveID, idType, content string) error {
+	if strings.TrimSpace(receiveID) == "" {
+		return errors.New("receive id is required")
+	}
+	if strings.TrimSpace(idType) == "" {
+		idType = "open_id"
+	}
+	if strings.TrimSpace(content) == "" {
+		return errors.New("interactive content is required")
+	}
+
+	body := larkim.NewCreateMessageReqBodyBuilder().
+		ReceiveId(receiveID).
+		MsgType("interactive").
+		Content(content).
+		Uuid(uuid.NewString()).
+		Build()
+	req := larkim.NewCreateMessageReqBuilder().
+		ReceiveIdType(idType).
+		Body(body).
+		Build()
+
+	resp, err := m.client.Im.V1.Message.Create(ctx, req)
+	if err != nil {
+		return err
+	}
+	if resp == nil {
+		return errors.New("send interactive failed: empty response")
+	}
+	if !resp.Success() {
+		return fmt.Errorf("send interactive failed: code=%d msg=%s", resp.Code, resp.Msg)
 	}
 	return nil
 }

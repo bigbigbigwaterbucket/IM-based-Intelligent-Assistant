@@ -6,7 +6,7 @@ export type TaskStatus =
   | "completed"
   | "failed";
 
-export type ActionType = "retry_task" | "approve_continue" | "open_artifact";
+export type ActionType = "retry_task" | "approve_continue" | "open_artifact" | "end_task";
 
 export type ConnectionStatus = "connecting" | "online" | "offline" | "reconnecting";
 
@@ -41,11 +41,16 @@ export interface Task {
   progressText: string;
   docUrl?: string;
   slidesUrl?: string;
+  docId?: string;
+  docArtifactPath?: string;
+  slidesArtifactPath?: string;
   summary?: string;
   requiresAction: boolean;
   errorMessage?: string;
   version: number;
   lastActor: string;
+  lastInteractionAt?: string;
+  idlePromptedAt?: string;
   createdAt: string;
   updatedAt: string;
   steps: StepRecord[];
@@ -112,11 +117,16 @@ export function normalizeTask(task: unknown): Task | null {
     progressText: candidate.progressText ?? "",
     docUrl: candidate.docUrl,
     slidesUrl: candidate.slidesUrl,
+    docId: candidate.docId,
+    docArtifactPath: candidate.docArtifactPath,
+    slidesArtifactPath: candidate.slidesArtifactPath,
     summary: candidate.summary,
     requiresAction: Boolean(candidate.requiresAction),
     errorMessage: candidate.errorMessage,
     version: Number(candidate.version ?? 0),
     lastActor: candidate.lastActor ?? "system",
+    lastInteractionAt: candidate.lastInteractionAt,
+    idlePromptedAt: candidate.idlePromptedAt,
     createdAt: candidate.createdAt ?? "",
     updatedAt: candidate.updatedAt ?? candidate.createdAt ?? "",
     steps: Array.isArray(candidate.steps) ? candidate.steps.map(normalizeStep).filter(isStep) : [],

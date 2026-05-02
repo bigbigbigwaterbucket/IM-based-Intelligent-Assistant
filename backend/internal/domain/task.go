@@ -23,26 +23,31 @@ const (
 )
 
 type Task struct {
-	TaskID          string     `json:"taskId"`
-	Title           string     `json:"title"`
-	UserInstruction string     `json:"userInstruction"`
-	Source          string     `json:"source"`
-	ChatID          string     `json:"chatId,omitempty"`
-	ThreadID        string     `json:"threadId,omitempty"`
-	MessageID       string     `json:"messageId,omitempty"`
-	Status          TaskStatus `json:"status"`
-	CurrentStep     string     `json:"currentStep"`
-	ProgressText    string     `json:"progressText"`
-	DocURL          string     `json:"docUrl,omitempty"`
-	SlidesURL       string     `json:"slidesUrl,omitempty"`
-	Summary         string     `json:"summary,omitempty"`
-	RequiresAction  bool       `json:"requiresAction"`
-	ErrorMessage    string     `json:"errorMessage,omitempty"`
-	Version         int        `json:"version"`
-	LastActor       string     `json:"lastActor"`
-	CreatedAt       time.Time  `json:"createdAt"`
-	UpdatedAt       time.Time  `json:"updatedAt"`
-	Steps           []Step     `json:"steps"`
+	TaskID             string     `json:"taskId"`
+	Title              string     `json:"title"`
+	UserInstruction    string     `json:"userInstruction"`
+	Source             string     `json:"source"`
+	ChatID             string     `json:"chatId,omitempty"`
+	ThreadID           string     `json:"threadId,omitempty"`
+	MessageID          string     `json:"messageId,omitempty"`
+	Status             TaskStatus `json:"status"`
+	CurrentStep        string     `json:"currentStep"`
+	ProgressText       string     `json:"progressText"`
+	DocURL             string     `json:"docUrl,omitempty"`
+	SlidesURL          string     `json:"slidesUrl,omitempty"`
+	DocID              string     `json:"docId,omitempty"`
+	DocArtifactPath    string     `json:"docArtifactPath,omitempty"`
+	SlidesArtifactPath string     `json:"slidesArtifactPath,omitempty"`
+	Summary            string     `json:"summary,omitempty"`
+	RequiresAction     bool       `json:"requiresAction"`
+	ErrorMessage       string     `json:"errorMessage,omitempty"`
+	Version            int        `json:"version"`
+	LastActor          string     `json:"lastActor"`
+	LastInteractionAt  *time.Time `json:"lastInteractionAt,omitempty"`
+	IdlePromptedAt     *time.Time `json:"idlePromptedAt,omitempty"`
+	CreatedAt          time.Time  `json:"createdAt"`
+	UpdatedAt          time.Time  `json:"updatedAt"`
+	Steps              []Step     `json:"steps"`
 }
 
 type Step struct {
@@ -136,4 +141,5 @@ const (
 	ActionRetryTask       ActionType = "retry_task"
 	ActionApproveContinue ActionType = "approve_continue"
 	ActionOpenArtifact    ActionType = "open_artifact"
+	ActionEndTask         ActionType = "end_task"
 )
