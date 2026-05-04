@@ -30,6 +30,9 @@ type Task struct {
 	ChatID             string     `json:"chatId,omitempty"`
 	ThreadID           string     `json:"threadId,omitempty"`
 	MessageID          string     `json:"messageId,omitempty"`
+	InitiatorUserID    string     `json:"initiatorUserId,omitempty"`
+	InitiatorOpenID    string     `json:"initiatorOpenId,omitempty"`
+	InitiatorUnionID   string     `json:"initiatorUnionId,omitempty"`
 	Status             TaskStatus `json:"status"`
 	CurrentStep        string     `json:"currentStep"`
 	ProgressText       string     `json:"progressText"`
@@ -116,6 +119,41 @@ type ConversationMessage struct {
 	Content   string    `json:"content"`
 	Metadata  string    `json:"metadata,omitempty"`
 	CreatedAt time.Time `json:"createdAt"`
+}
+
+type ChatMessage struct {
+	MessageID     string    `json:"messageId"`
+	ChatID        string    `json:"chatId"`
+	ThreadID      string    `json:"threadId,omitempty"`
+	SenderUserID  string    `json:"senderUserId,omitempty"`
+	SenderOpenID  string    `json:"senderOpenId,omitempty"`
+	SenderUnionID string    `json:"senderUnionId,omitempty"`
+	Content       string    `json:"content"`
+	ChatType      string    `json:"chatType,omitempty"`
+	CreatedAt     time.Time `json:"createdAt"`
+}
+
+type ProactiveCandidateStatus string
+
+const (
+	CandidatePending   ProactiveCandidateStatus = "pending"
+	CandidateConfirmed ProactiveCandidateStatus = "confirmed"
+	CandidateIgnored   ProactiveCandidateStatus = "ignored"
+)
+
+type ProactiveCandidate struct {
+	CandidateID     string                   `json:"candidateId"`
+	ChatID          string                   `json:"chatId"`
+	ThreadID        string                   `json:"threadId,omitempty"`
+	SourceMessageID string                   `json:"sourceMessageId"`
+	Title           string                   `json:"title"`
+	Instruction     string                   `json:"instruction"`
+	ContextJSON     string                   `json:"contextJson,omitempty"`
+	ThemeKey        string                   `json:"themeKey"`
+	Status          ProactiveCandidateStatus `json:"status"`
+	ExpiresAt       time.Time                `json:"expiresAt"`
+	CreatedAt       time.Time                `json:"createdAt"`
+	UpdatedAt       time.Time                `json:"updatedAt"`
 }
 
 type ToolInvocation struct {

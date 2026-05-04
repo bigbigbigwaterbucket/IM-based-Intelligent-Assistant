@@ -111,7 +111,7 @@ func (r *Runner) FetchThread(ctx context.Context, task domain.Task, step domain.
 		return failed("im.fetch_thread", fmt.Errorf("Feishu IM list failed: code=%d msg=%s", resp.Code, resp.Msg))
 	}
 
-	messages := normalizeMessages(resp.Data, task.ThreadID)
+	messages := r.normalizeMessages(resp.Data, task.ThreadID)
 	if len(messages) > 0 {
 		data["messages"] = strings.Join(messages, "\n")
 	}
@@ -860,7 +860,7 @@ func firstMarkdownTitle(markdown string) string {
 	return "任务演示稿"
 }
 
-func normalizeMessages(data *larkim.ListMessageRespData, threadID string) []string {
+func (r *Runner) normalizeMessages(data *larkim.ListMessageRespData, threadID string) []string {
 	if data == nil {
 		return nil
 	}
@@ -888,6 +888,9 @@ func normalizeMessages(data *larkim.ListMessageRespData, threadID string) []stri
 		if item == nil {
 			continue
 		}
+		if r.isBotAuthoredMessage(item) {
+			continue
+		}
 		sender := "unknown"
 		if item.Sender != nil && item.Sender.Id != nil {
 			sender = *item.Sender.Id
@@ -903,6 +906,24 @@ func normalizeMessages(data *larkim.ListMessageRespData, threadID string) []stri
 		out = append(out, fmt.Sprintf("%s %s: %s", formatMessageTime(stringValue(item.CreateTime)), sender, content))
 	}
 	return out
+}
+
+func (r *Runner) isBotAuthoredMessage(item *larkim.Message) bool {
+	if item == nil || item.Sender == nil {
+		return false
+	}
+	senderType := strings.ToLower(strings.TrimSpace(stringValue(item.Sender.SenderType)))
+	if senderType == "app" {
+		return true
+	}
+	idType := strings.ToLower(strings.TrimSpace(stringValue(item.Sender.IdType)))
+	if idType == "app_id" {
+		return true
+	}
+	if r != nil && strings.TrimSpace(r.config.FeishuAppID) != "" && stringValue(item.Sender.Id) == r.config.FeishuAppID {
+		return true
+	}
+	return false
 }
 
 func messageContentText(msgType, raw string) string {

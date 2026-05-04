@@ -73,6 +73,47 @@ func TestLLMGreetingPlanIsValidWithoutArtifacts(t *testing.T) {
 	}
 }
 
+func TestLLMDocPlanIsValidWithoutPlannerAuthoredDocumentContent(t *testing.T) {
+	t.Parallel()
+
+	plan := domain.Plan{
+		Summary: "生成文档",
+		Analysis: domain.IntentAnalysis{
+			Objective:    "生成可评审方案",
+			Audience:     "管理层",
+			Deliverables: []string{"方案文档"},
+		},
+		Steps: []domain.PlanStep{
+			{ID: "s1", Tool: "intent.analyze", Description: "分析意图"},
+			{ID: "s2", Tool: "doc.create", Description: "创建文档产物"},
+			{ID: "s3", Tool: "doc.append", Description: "由执行 agent 写入完整文档内容"},
+		},
+	}
+	if !validPlan(plan) {
+		t.Fatal("expected doc plan without doc title or sections to be valid")
+	}
+}
+
+func TestLLMSlidePlanIsValidWithoutPlannerAuthoredSlideContent(t *testing.T) {
+	t.Parallel()
+
+	plan := domain.Plan{
+		Summary: "生成演示稿",
+		Analysis: domain.IntentAnalysis{
+			Objective:    "生成汇报演示稿",
+			Audience:     "管理层",
+			Deliverables: []string{"演示稿"},
+		},
+		Steps: []domain.PlanStep{
+			{ID: "s1", Tool: "intent.analyze", Description: "分析意图"},
+			{ID: "s2", Tool: "slide.generate", Description: "由执行 agent 生成完整演示稿内容"},
+		},
+	}
+	if !validPlan(plan) {
+		t.Fatal("expected slide plan without slide title or pages to be valid")
+	}
+}
+
 func TestBuildPlanUsesLLMWhenConfigured(t *testing.T) {
 	t.Parallel()
 
@@ -110,8 +151,11 @@ func TestBuildPlanUsesLLMWhenConfigured(t *testing.T) {
 	if plan.Summary != "LLM规划完成" {
 		t.Fatalf("expected llm summary, got %s", plan.Summary)
 	}
-	if plan.DocTitle != "LLM文档" {
-		t.Fatalf("expected llm doc title, got %s", plan.DocTitle)
+	if plan.DocTitle != "LLM文档" || len(plan.DocumentSections) != 0 {
+		t.Fatalf("expected llm planner doc title to be kept and sections discarded, got title=%q sections=%#v", plan.DocTitle, plan.DocumentSections)
+	}
+	if plan.SlideTitle != "LLM演示稿" || len(plan.Slides) != 0 {
+		t.Fatalf("expected llm planner slide title to be kept and slides discarded, got title=%q slides=%#v", plan.SlideTitle, plan.Slides)
 	}
 	if plan.PlannerSource != "llm" {
 		t.Fatalf("expected planner source llm, got %s", plan.PlannerSource)
@@ -159,6 +203,12 @@ func TestBuildRevisionPlanUsesLLMWhenConfigured(t *testing.T) {
 	}
 	if len(plan.Steps) != 2 || plan.Steps[1].Tool != "doc.update" {
 		t.Fatalf("expected llm doc update plan, got %#v", plan.Steps)
+	}
+	if plan.DocTitle != "更新文档" || len(plan.DocumentSections) != 0 {
+		t.Fatalf("expected llm revision planner doc title to be kept and sections discarded, got title=%q sections=%#v", plan.DocTitle, plan.DocumentSections)
+	}
+	if plan.SlideTitle != "更新演示稿" || len(plan.Slides) != 0 {
+		t.Fatalf("expected llm revision planner slide title to be kept and slides discarded, got title=%q slides=%#v", plan.SlideTitle, plan.Slides)
 	}
 }
 

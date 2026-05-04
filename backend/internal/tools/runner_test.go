@@ -9,6 +9,7 @@ import (
 
 	"agentpilot/backend/internal/domain"
 	larkdocx "github.com/larksuite/oapi-sdk-go/v3/service/docx/v1"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 )
 
 func TestCreateDocAndSlidesWriteArtifacts(t *testing.T) {
@@ -91,6 +92,35 @@ func TestCreateDocUsesFetchedChatMessages(t *testing.T) {
 	assertFileContains(t, doc.ArtifactPath, "## 原始消息摘录")
 	assertFileNotContains(t, doc.ArtifactPath, "## 意图分析")
 	assertFileNotContains(t, doc.ArtifactPath, "## 执行计划")
+}
+
+func TestNormalizeMessagesSkipsBotAuthoredMessages(t *testing.T) {
+	t.Parallel()
+
+	runner := NewRunner(Config{FeishuAppID: "cli_bot"})
+	messages := runner.normalizeMessages(&larkim.ListMessageRespData{
+		Items: []*larkim.Message{
+			{
+				MsgType:    stringPtr("text"),
+				CreateTime: stringPtr("1000"),
+				Sender:     &larkim.Sender{Id: stringPtr("ou_user"), IdType: stringPtr("open_id"), SenderType: stringPtr("user")},
+				Body:       &larkim.MessageBody{Content: stringPtr(`{"text":"用户消息"}`)},
+			},
+			{
+				MsgType:    stringPtr("text"),
+				CreateTime: stringPtr("2000"),
+				Sender:     &larkim.Sender{Id: stringPtr("cli_bot"), IdType: stringPtr("app_id"), SenderType: stringPtr("app")},
+				Body:       &larkim.MessageBody{Content: stringPtr(`{"text":"Assistant任务已启动：task-1"}`)},
+			},
+		},
+	}, "")
+
+	if len(messages) != 1 {
+		t.Fatalf("expected one user message, got %#v", messages)
+	}
+	if strings.Contains(messages[0], "Assistant任务已启动") || !strings.Contains(messages[0], "用户消息") {
+		t.Fatalf("unexpected normalized messages: %#v", messages)
+	}
 }
 
 func TestCreateDocUsesGeneratedMarkdown(t *testing.T) {
@@ -237,4 +267,8 @@ func assertFileExists(t *testing.T, path string) {
 	if info.Size() == 0 {
 		t.Fatalf("expected %s to be non-empty", path)
 	}
+}
+
+func stringPtr(value string) *string {
+	return &value
 }

@@ -253,6 +253,69 @@ func TestWaitTaskDoneTimesOut(t *testing.T) {
 	}
 }
 
+func TestSubmitEndTaskRequiresFeishuInitiator(t *testing.T) {
+	t.Parallel()
+
+	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	defer db.Close()
+
+	taskStore, err := store.NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+
+	service := New(
+		taskStore,
+		statehub.NewHub(),
+		planner.NewServiceWithLLM(nil),
+		tools.NewRunner(tools.Config{ArtifactDir: t.TempDir()}),
+	)
+
+	now := time.Now()
+	task := domain.Task{
+		TaskID:          "waiting-feishu",
+		Title:           "待结束任务",
+		UserInstruction: "测试",
+		Source:          "feishu_group",
+		ChatID:          "oc_test",
+		InitiatorOpenID: "ou_owner",
+		Status:          domain.StatusWaitingAction,
+		CurrentStep:     "awaiting_feedback",
+		ProgressText:    "等待审核",
+		RequiresAction:  true,
+		Version:         1,
+		LastActor:       "agent",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+	if _, err := taskStore.Create(context.Background(), task); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+
+	if _, err := service.SubmitAction(context.Background(), task.TaskID, ActionInput{
+		ActionType:  string(domain.ActionEndTask),
+		ActorType:   "feishu_card",
+		ActorOpenID: "ou_other",
+	}); err == nil {
+		t.Fatal("expected non-initiator end task to be rejected")
+	}
+
+	ended, err := service.SubmitAction(context.Background(), task.TaskID, ActionInput{
+		ActionType:  string(domain.ActionEndTask),
+		ActorType:   "feishu_card",
+		ActorOpenID: "ou_owner",
+	})
+	if err != nil {
+		t.Fatalf("end task as initiator: %v", err)
+	}
+	if ended.Status != domain.StatusCompleted {
+		t.Fatalf("expected completed task, got %s", ended.Status)
+	}
+}
+
 func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
 	t.Helper()
 

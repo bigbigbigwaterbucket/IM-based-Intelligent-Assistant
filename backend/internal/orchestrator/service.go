@@ -18,12 +18,15 @@ import (
 )
 
 type CreateTaskInput struct {
-	Title       string `json:"title"`
-	Instruction string `json:"instruction"`
-	Source      string `json:"source"`
-	ChatID      string `json:"chatId"`
-	ThreadID    string `json:"threadId"`
-	MessageID   string `json:"messageId"`
+	Title            string `json:"title"`
+	Instruction      string `json:"instruction"`
+	Source           string `json:"source"`
+	ChatID           string `json:"chatId"`
+	ThreadID         string `json:"threadId"`
+	MessageID        string `json:"messageId"`
+	InitiatorUserID  string `json:"initiatorUserId"`
+	InitiatorOpenID  string `json:"initiatorOpenId"`
+	InitiatorUnionID string `json:"initiatorUnionId"`
 }
 
 type ContinueTaskInput struct {
@@ -34,9 +37,23 @@ type ContinueTaskInput struct {
 }
 
 type ActionInput struct {
-	ActionType string `json:"actionType"`
-	ActorType  string `json:"actorType"`
-	ClientID   string `json:"clientId"`
+	ActionType   string `json:"actionType"`
+	ActorType    string `json:"actorType"`
+	ClientID     string `json:"clientId"`
+	ActorUserID  string `json:"actorUserId"`
+	ActorOpenID  string `json:"actorOpenId"`
+	ActorUnionID string `json:"actorUnionId"`
+}
+
+type CreateProactiveCandidateInput struct {
+	ChatID          string `json:"chatId"`
+	ThreadID        string `json:"threadId"`
+	SourceMessageID string `json:"sourceMessageId"`
+	Title           string `json:"title"`
+	Instruction     string `json:"instruction"`
+	ContextJSON     string `json:"contextJson"`
+	ThemeKey        string `json:"themeKey"`
+	TTL             time.Duration
 }
 
 type Service struct {
@@ -87,6 +104,9 @@ func (s *Service) CreateTask(ctx context.Context, input CreateTaskInput) (domain
 		ChatID:            input.ChatID,
 		ThreadID:          input.ThreadID,
 		MessageID:         input.MessageID,
+		InitiatorUserID:   input.InitiatorUserID,
+		InitiatorOpenID:   input.InitiatorOpenID,
+		InitiatorUnionID:  input.InitiatorUnionID,
 		Status:            domain.StatusCreated,
 		CurrentStep:       "created",
 		ProgressText:      "任务已创建，等待规划",
@@ -166,7 +186,7 @@ func (s *Service) SubmitAction(ctx context.Context, taskID string, input ActionI
 	switch input.ActionType {
 	case string(domain.ActionRetryTask):
 		if task.Status != domain.StatusFailed {
-			return domain.Task{}, errors.New("only failed tasks can be retried")
+			return domain.Task{}, errors.New("只有失败的任务可以被重试")
 		}
 		task.Status = domain.StatusCreated
 		task.RequiresAction = false
@@ -204,11 +224,14 @@ func (s *Service) SubmitAction(ctx context.Context, taskID string, input ActionI
 		return task, nil
 	case string(domain.ActionEndTask):
 		if task.Status != domain.StatusWaitingAction {
-			return domain.Task{}, errors.New("only waiting tasks can be ended")
+			return domain.Task{}, errors.New("只有待审核的任务可以被结束")
+		}
+		if !canActorEndTask(task, input) {
+			return domain.Task{}, errors.New("只有任务启动者可以结束该任务")
 		}
 		return s.endTask(ctx, task, fallback(input.ActorType, "user"), "Task ended by user")
 	default:
-		return domain.Task{}, errors.New("unsupported action")
+		return domain.Task{}, errors.New("不支持的操作")
 	}
 }
 
@@ -248,6 +271,125 @@ func (s *Service) MarkIdlePrompted(ctx context.Context, taskID string) (domain.T
 		return domain.Task{}, errors.New("task state update failed")
 	}
 	return task, nil
+}
+
+func (s *Service) CreateProactiveCandidate(ctx context.Context, input CreateProactiveCandidateInput) (domain.ProactiveCandidate, error) {
+	repo, ok := s.store.(store.ProactiveCandidateRepository)
+	if !ok {
+		return domain.ProactiveCandidate{}, errors.New("proactive candidate repository is not available")
+	}
+	if strings.TrimSpace(input.ChatID) == "" {
+		return domain.ProactiveCandidate{}, errors.New("chat id is required")
+	}
+	if strings.TrimSpace(input.Title) == "" || strings.TrimSpace(input.Instruction) == "" {
+		return domain.ProactiveCandidate{}, errors.New("title and instruction are required")
+	}
+	if strings.TrimSpace(input.ThemeKey) == "" {
+		return domain.ProactiveCandidate{}, errors.New("theme key is required")
+	}
+	if input.TTL <= 0 {
+		input.TTL = 24 * time.Hour
+	}
+	now := time.Now()
+	return repo.CreateProactiveCandidate(ctx, domain.ProactiveCandidate{
+		CandidateID:     uuid.NewString(),
+		ChatID:          input.ChatID,
+		ThreadID:        input.ThreadID,
+		SourceMessageID: input.SourceMessageID,
+		Title:           input.Title,
+		Instruction:     input.Instruction,
+		ContextJSON:     input.ContextJSON,
+		ThemeKey:        input.ThemeKey,
+		Status:          domain.CandidatePending,
+		ExpiresAt:       now.Add(input.TTL),
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+}
+
+func (s *Service) AppendChatMessage(ctx context.Context, message domain.ChatMessage, keepLimit int) error {
+	repo, ok := s.store.(store.ChatMessageRepository)
+	if !ok {
+		return errors.New("chat message repository is not available")
+	}
+	return repo.AppendChatMessage(ctx, message, keepLimit)
+}
+
+func (s *Service) ListRecentChatMessages(ctx context.Context, chatID string, limit int) ([]domain.ChatMessage, error) {
+	repo, ok := s.store.(store.ChatMessageRepository)
+	if !ok {
+		return nil, errors.New("chat message repository is not available")
+	}
+	return repo.ListRecentChatMessages(ctx, chatID, limit)
+}
+
+func (s *Service) ConsumeChatMessages(ctx context.Context, chatID, throughMessageID string) error {
+	repo, ok := s.store.(store.ChatMessageRepository)
+	if !ok {
+		return errors.New("chat message repository is not available")
+	}
+	return repo.ConsumeChatMessages(ctx, chatID, throughMessageID)
+}
+
+func (s *Service) HasRecentProactiveCandidate(ctx context.Context, chatID, themeKey string, cooldown time.Duration) (bool, error) {
+	repo, ok := s.store.(store.ProactiveCandidateRepository)
+	if !ok {
+		return false, errors.New("proactive candidate repository is not available")
+	}
+	if cooldown <= 0 {
+		cooldown = time.Hour
+	}
+	return repo.HasRecentProactiveCandidate(ctx, chatID, themeKey, time.Now().Add(-cooldown))
+}
+
+func (s *Service) LatestProactiveThemeKey(ctx context.Context, chatID string) (string, error) {
+	repo, ok := s.store.(store.ProactiveCandidateRepository)
+	if !ok {
+		return "", errors.New("proactive candidate repository is not available")
+	}
+	return repo.LatestProactiveThemeKey(ctx, chatID)
+}
+
+func (s *Service) ConfirmProactiveCandidate(ctx context.Context, candidateID string, input ActionInput) (domain.Task, error) {
+	repo, ok := s.store.(store.ProactiveCandidateRepository)
+	if !ok {
+		return domain.Task{}, errors.New("proactive candidate repository is not available")
+	}
+	candidate, err := repo.GetProactiveCandidate(ctx, candidateID)
+	if err != nil {
+		return domain.Task{}, err
+	}
+	if candidate.Status != domain.CandidatePending {
+		return domain.Task{}, errors.New("proactive candidate is not pending")
+	}
+	if !candidate.ExpiresAt.IsZero() && time.Now().After(candidate.ExpiresAt) {
+		_, _ = repo.UpdateProactiveCandidateStatus(ctx, candidateID, domain.CandidateIgnored)
+		return domain.Task{}, errors.New("proactive candidate has expired")
+	}
+	task, err := s.CreateTask(ctx, CreateTaskInput{
+		Title:            candidate.Title,
+		Instruction:      candidate.Instruction,
+		Source:           "feishu_proactive",
+		ChatID:           candidate.ChatID,
+		ThreadID:         candidate.ThreadID,
+		MessageID:        candidate.SourceMessageID,
+		InitiatorUserID:  input.ActorUserID,
+		InitiatorOpenID:  input.ActorOpenID,
+		InitiatorUnionID: input.ActorUnionID,
+	})
+	if err != nil {
+		return domain.Task{}, err
+	}
+	_, _ = repo.UpdateProactiveCandidateStatus(ctx, candidateID, domain.CandidateConfirmed)
+	return task, nil
+}
+
+func (s *Service) IgnoreProactiveCandidate(ctx context.Context, candidateID string) (domain.ProactiveCandidate, error) {
+	repo, ok := s.store.(store.ProactiveCandidateRepository)
+	if !ok {
+		return domain.ProactiveCandidate{}, errors.New("proactive candidate repository is not available")
+	}
+	return repo.UpdateProactiveCandidateStatus(ctx, candidateID, domain.CandidateIgnored)
 }
 
 func (s *Service) GetTask(ctx context.Context, taskID string) (domain.Task, error) {
@@ -547,6 +689,22 @@ func (s *Service) endTask(ctx context.Context, task domain.Task, actorType, summ
 	}
 	s.hub.Broadcast("action.resolved", task.TaskID, task.Version, task)
 	return task, nil
+}
+
+func canActorEndTask(task domain.Task, input ActionInput) bool {
+	if input.ActorType != "feishu_card" {
+		return true
+	}
+	if task.InitiatorUserID == "" && task.InitiatorOpenID == "" && task.InitiatorUnionID == "" {
+		return true
+	}
+	return sameNonEmptyID(task.InitiatorUserID, input.ActorUserID) ||
+		sameNonEmptyID(task.InitiatorOpenID, input.ActorOpenID) ||
+		sameNonEmptyID(task.InitiatorUnionID, input.ActorUnionID)
+}
+
+func sameNonEmptyID(expected, actual string) bool {
+	return strings.TrimSpace(expected) != "" && strings.TrimSpace(expected) == strings.TrimSpace(actual)
 }
 
 func (s *Service) failTask(ctx context.Context, taskID, message string, requiresAction bool) {

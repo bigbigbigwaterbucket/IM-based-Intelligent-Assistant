@@ -13,6 +13,8 @@ import (
 
 	"agentpilot/backend/internal/domain"
 	"agentpilot/backend/internal/orchestrator"
+	"agentpilot/backend/internal/proactive"
+	"agentpilot/backend/internal/store"
 
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
@@ -23,6 +25,11 @@ type TaskLauncher interface {
 	ContinueTask(ctx context.Context, input orchestrator.ContinueTaskInput) (domain.Task, error)
 	EndActiveTask(ctx context.Context, sessionID, actorType string) (domain.Task, error)
 	SubmitAction(ctx context.Context, taskID string, input orchestrator.ActionInput) (domain.Task, error)
+	CreateProactiveCandidate(ctx context.Context, input orchestrator.CreateProactiveCandidateInput) (domain.ProactiveCandidate, error)
+	HasRecentProactiveCandidate(ctx context.Context, chatID, themeKey string, cooldown time.Duration) (bool, error)
+	LatestProactiveThemeKey(ctx context.Context, chatID string) (string, error)
+	ConfirmProactiveCandidate(ctx context.Context, candidateID string, input orchestrator.ActionInput) (domain.Task, error)
+	IgnoreProactiveCandidate(ctx context.Context, candidateID string) (domain.ProactiveCandidate, error)
 	ListIdleWaitingTasks(ctx context.Context, idleFor time.Duration) ([]domain.Task, error)
 	MarkIdlePrompted(ctx context.Context, taskID string) (domain.Task, error)
 	WaitTaskDone(ctx context.Context, taskID string, timeout, interval time.Duration) (domain.Task, error)
@@ -32,8 +39,12 @@ type Handler struct {
 	launcher      TaskLauncher
 	messenger     TextMessenger
 	publicBaseURL string
+	botAppID      string
 	doneTimeout   time.Duration
 	doneInterval  time.Duration
+	proactiveCfg  proactive.Config
+	detector      *proactive.Detector
+	chatHistory   store.ChatMessageRepository
 }
 
 func NewHandler(launcher TaskLauncher, messenger TextMessenger, publicBaseURL string) *Handler {
@@ -46,15 +57,41 @@ func NewHandler(launcher TaskLauncher, messenger TextMessenger, publicBaseURL st
 	}
 }
 
+func (h *Handler) SetBotIdentity(appID string) {
+	h.botAppID = strings.TrimSpace(appID)
+}
+
+func (h *Handler) SetProactiveDetector(config proactive.Config, detector *proactive.Detector) {
+	h.proactiveCfg = config
+	h.detector = detector
+	if history, ok := h.launcher.(store.ChatMessageRepository); ok {
+		h.chatHistory = history
+	}
+}
+
 func (h *Handler) HandleMessage(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
+	if h.isBotMessage(event) {
+		return nil
+	}
 	in, ok := eventInput(event)
 	if !ok {
 		return nil
 	}
+	println(in.content)
 	cmd, ok := ParseTextContent(in.messageType, in.content)
 	if !ok {
-		return nil
+		return h.handleProactiveMessage(ctx, in)
 	}
+	if cmd.Name != AssistantCommand {
+		return h.handleProactiveMessage(ctx, in)
+	}
+	if cmd.Help {
+		return h.messenger.ReplyText(ctx, in.messageID, "用法：/assistant <需求>\n使用 /assistant new <需求> 开始一个新任务。")
+	}
+	return h.handleAssistantCommand(ctx, in, cmd)
+}
+
+func (h *Handler) handleAssistantCommand(ctx context.Context, in incomingMessage, cmd Command) error {
 	if cmd.Name != AssistantCommand {
 		return nil
 	}
@@ -83,17 +120,21 @@ func (h *Handler) HandleMessage(ctx context.Context, event *larkim.P2MessageRece
 			return nil
 		}
 		if strings.Contains(err.Error(), "still running") {
+			println("", err.Error())
 			return h.messenger.ReplyText(ctx, in.messageID, "当前Assistant任务仍在处理中，请等待完成后再发送修改要求。")
 		}
 	}
 
 	task, err := h.launcher.CreateTask(ctx, orchestrator.CreateTaskInput{
-		Title:       taskTitle(cmd.Intent),
-		Instruction: cmd.Intent,
-		Source:      sourceForChatType(in.chatType),
-		ChatID:      in.chatID,
-		ThreadID:    in.threadID,
-		MessageID:   in.messageID,
+		Title:            taskTitle(cmd.Intent),
+		Instruction:      cmd.Intent,
+		Source:           sourceForChatType(in.chatType),
+		ChatID:           in.chatID,
+		ThreadID:         in.threadID,
+		MessageID:        in.messageID,
+		InitiatorUserID:  in.senderUserID,
+		InitiatorOpenID:  in.senderOpenID,
+		InitiatorUnionID: in.senderUnionID,
 	})
 	if err != nil {
 		return h.messenger.ReplyText(ctx, in.messageID, "Assistant任务启动失败："+err.Error())
@@ -113,18 +154,124 @@ func (h *Handler) HandleCardAction(ctx context.Context, event *callback.CardActi
 		value = event.Event.Action.Value
 	}
 	action, _ := value["action"].(string)
+	if action == "proactive_task_confirm" {
+		return h.handleProactiveConfirm(ctx, event, value)
+	}
+	if action == "proactive_task_ignore" {
+		return h.handleProactiveIgnore(ctx, value)
+	}
 	taskID, _ := value["task_id"].(string)
 	if action != string(domain.ActionEndTask) || strings.TrimSpace(taskID) == "" {
 		return cardToast("warning", "不支持的操作。"), nil
 	}
 	if _, err := h.launcher.SubmitAction(ctx, taskID, orchestrator.ActionInput{
-		ActionType: string(domain.ActionEndTask),
-		ActorType:  "feishu_card",
-		ClientID:   "feishu_card",
+		ActionType:   string(domain.ActionEndTask),
+		ActorType:    "feishu_card",
+		ClientID:     "feishu_card",
+		ActorUserID:  cardOperatorUserID(event),
+		ActorOpenID:  cardOperatorOpenID(event),
+		ActorUnionID: cardOperatorUnionID(event),
 	}); err != nil {
 		return cardToast("error", err.Error()), nil
 	}
 	return cardToast("success", "已关闭当前Assistant任务。"), nil
+}
+
+func (h *Handler) handleProactiveMessage(ctx context.Context, in incomingMessage) error {
+	if !h.proactiveCfg.Enabled || h.detector == nil || h.chatHistory == nil {
+		return nil
+	}
+	// 非群聊消息不会主动发起总结
+	if in.messageType != "text" || in.chatID == "" || !isGroupChat(in.chatType) {
+		return nil
+	}
+	text := strings.TrimSpace(in.text())
+	if text == "" {
+		return nil
+	}
+	message := domain.ChatMessage{
+		MessageID:     in.messageID,
+		ChatID:        in.chatID,
+		ThreadID:      in.threadID,
+		SenderUserID:  in.senderUserID,
+		SenderOpenID:  in.senderOpenID,
+		SenderUnionID: in.senderUnionID,
+		Content:       text,
+		ChatType:      in.chatType,
+		CreatedAt:     time.Now(),
+	}
+	if err := h.chatHistory.AppendChatMessage(ctx, message, h.proactiveCfg.CacheLimit); err != nil {
+		return nil
+	}
+	messages, err := h.chatHistory.ListRecentChatMessages(ctx, in.chatID, h.proactiveCfg.CacheLimit)
+	if err != nil {
+		return nil
+	}
+	previousThemeKey, _ := h.launcher.LatestProactiveThemeKey(ctx, in.chatID)
+	candidate, err := h.detector.DetectWithPreviousThemeKey(ctx, messages, previousThemeKey)
+	if err != nil || !candidate.Ready {
+		return nil
+	}
+	cooling, err := h.launcher.HasRecentProactiveCandidate(ctx, in.chatID, candidate.ThemeKey, h.proactiveCfg.Cooldown)
+	if err != nil || cooling {
+		return nil
+	}
+	saved, err := h.launcher.CreateProactiveCandidate(ctx, orchestrator.CreateProactiveCandidateInput{
+		ChatID:          in.chatID,
+		ThreadID:        in.threadID,
+		SourceMessageID: in.messageID,
+		Title:           candidate.Title,
+		Instruction:     candidate.Instruction,
+		ContextJSON:     candidate.ContextJSON,
+		ThemeKey:        candidate.ThemeKey,
+		TTL:             24 * time.Hour,
+	})
+	if err != nil {
+		return nil
+	}
+	content, err := proactiveTaskCardContent(saved, candidate, len(messages))
+	if err != nil {
+		return nil
+	}
+	_ = h.messenger.SendInteractive(ctx, in.chatID, "chat_id", content)
+	return nil
+}
+
+func (h *Handler) handleProactiveConfirm(ctx context.Context, event *callback.CardActionTriggerEvent, value map[string]any) (*callback.CardActionTriggerResponse, error) {
+	candidateID, _ := value["candidate_id"].(string)
+	if strings.TrimSpace(candidateID) == "" {
+		return cardToast("warning", "缺少候选任务。"), nil
+	}
+	task, err := h.launcher.ConfirmProactiveCandidate(ctx, candidateID, orchestrator.ActionInput{
+		ActionType:   "proactive_task_confirm",
+		ActorType:    "feishu_card",
+		ClientID:     "feishu_card",
+		ActorUserID:  cardOperatorUserID(event),
+		ActorOpenID:  cardOperatorOpenID(event),
+		ActorUnionID: cardOperatorUnionID(event),
+	})
+	if err != nil {
+		return cardToast("error", err.Error()), nil
+	}
+	if task.ChatID != "" {
+		if h.chatHistory != nil {
+			_ = h.chatHistory.ConsumeChatMessages(ctx, task.ChatID, task.MessageID)
+		}
+		_ = h.messenger.SendText(ctx, task.ChatID, "chat_id", h.startedText(task))
+	}
+	go h.notifyWhenDone(task.MessageID, task.TaskID)
+	return cardToast("success", "已启动Assistant任务。"), nil
+}
+
+func (h *Handler) handleProactiveIgnore(ctx context.Context, value map[string]any) (*callback.CardActionTriggerResponse, error) {
+	candidateID, _ := value["candidate_id"].(string)
+	if strings.TrimSpace(candidateID) == "" {
+		return cardToast("warning", "缺少候选任务。"), nil
+	}
+	if _, err := h.launcher.IgnoreProactiveCandidate(ctx, candidateID); err != nil {
+		return cardToast("error", err.Error()), nil
+	}
+	return cardToast("success", "已忽略该候选任务。"), nil
 }
 
 func (h *Handler) PromptIdleTasks(ctx context.Context, idleFor time.Duration) {
@@ -227,12 +374,45 @@ func (h *Handler) publicLink(raw string) string {
 }
 
 type incomingMessage struct {
-	messageID   string
-	messageType string
-	content     string
-	chatType    string
-	chatID      string
-	threadID    string
+	messageID     string
+	messageType   string
+	content       string
+	chatType      string
+	chatID        string
+	threadID      string
+	senderUserID  string
+	senderOpenID  string
+	senderUnionID string
+}
+
+func (in incomingMessage) text() string {
+	cmd, ok := ParseTextContent(in.messageType, in.content)
+	if ok {
+		return cmd.Intent
+	}
+	var payload struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(in.content), &payload); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(payload.Text)
+}
+
+func (h *Handler) isBotMessage(event *larkim.P2MessageReceiveV1) bool {
+	if event == nil || event.Event == nil || event.Event.Sender == nil {
+		return false
+	}
+	sender := event.Event.Sender
+	if strings.EqualFold(strings.TrimSpace(stringValue(sender.SenderType)), "app") {
+		return true
+	}
+	if strings.TrimSpace(h.botAppID) == "" || sender.SenderId == nil {
+		return false
+	}
+	return stringValue(sender.SenderId.UserId) == h.botAppID ||
+		stringValue(sender.SenderId.OpenId) == h.botAppID ||
+		stringValue(sender.SenderId.UnionId) == h.botAppID
 }
 
 func eventInput(event *larkim.P2MessageReceiveV1) (incomingMessage, bool) {
@@ -245,12 +425,15 @@ func eventInput(event *larkim.P2MessageReceiveV1) (incomingMessage, bool) {
 
 	message := event.Event.Message
 	in := incomingMessage{
-		messageID:   stringValue(message.MessageId),
-		messageType: stringValue(message.MessageType),
-		content:     stringValue(message.Content),
-		chatType:    stringValue(message.ChatType),
-		chatID:      stringValue(message.ChatId),
-		threadID:    stringValue(message.ThreadId),
+		messageID:     stringValue(message.MessageId),
+		messageType:   stringValue(message.MessageType),
+		content:       stringValue(message.Content),
+		chatType:      stringValue(message.ChatType),
+		chatID:        stringValue(message.ChatId),
+		threadID:      stringValue(message.ThreadId),
+		senderUserID:  messageSenderUserID(event.Event.Sender),
+		senderOpenID:  messageSenderOpenID(event.Event.Sender),
+		senderUnionID: messageSenderUnionID(event.Event.Sender),
 	}
 	if in.messageID == "" {
 		return incomingMessage{}, false
@@ -279,6 +462,10 @@ func sourceForChatType(chatType string) string {
 	default:
 		return "feishu"
 	}
+}
+
+func isGroupChat(chatType string) bool {
+	return chatType == "group" || chatType == "topic_group"
 }
 
 func sessionIDForMessage(in incomingMessage) string {
@@ -326,6 +513,57 @@ func idleTaskCardContent(task domain.Task) (string, error) {
 	return string(payload), nil
 }
 
+func proactiveTaskCardContent(candidate domain.ProactiveCandidate, detected proactive.Candidate, messageCount int) (string, error) {
+	title := candidate.Title
+	if strings.TrimSpace(title) == "" {
+		title = "可能的Assistant任务"
+	}
+	reason := strings.TrimSpace(detected.Reason)
+	if reason == "" {
+		reason = "群聊中出现了办公任务信号"
+	}
+	card := map[string]any{
+		"config": map[string]any{"wide_screen_mode": true},
+		"header": map[string]any{
+			"title": map[string]any{"tag": "plain_text", "content": "检测到可能需要启动Assistant任务"},
+		},
+		"elements": []any{
+			map[string]any{
+				"tag":  "div",
+				"text": map[string]any{"tag": "lark_md", "content": fmt.Sprintf("**%s**\n%s\n已参考最近 %d 条群聊消息。", title, reason, messageCount)},
+			},
+			map[string]any{
+				"tag": "action",
+				"actions": []any{
+					map[string]any{
+						"tag":  "button",
+						"text": map[string]any{"tag": "plain_text", "content": "启动任务"},
+						"type": "primary",
+						"value": map[string]any{
+							"action":       "proactive_task_confirm",
+							"candidate_id": candidate.CandidateID,
+						},
+					},
+					map[string]any{
+						"tag":  "button",
+						"text": map[string]any{"tag": "plain_text", "content": "忽略"},
+						"type": "default",
+						"value": map[string]any{
+							"action":       "proactive_task_ignore",
+							"candidate_id": candidate.CandidateID,
+						},
+					},
+				},
+			},
+		},
+	}
+	payload, err := json.Marshal(card)
+	if err != nil {
+		return "", err
+	}
+	return string(payload), nil
+}
+
 func cardToast(toastType, content string) *callback.CardActionTriggerResponse {
 	return &callback.CardActionTriggerResponse{
 		Toast: &callback.Toast{
@@ -340,6 +578,45 @@ func stringValue(value *string) string {
 		return ""
 	}
 	return *value
+}
+
+func messageSenderUserID(sender *larkim.EventSender) string {
+	if sender == nil || sender.SenderId == nil {
+		return ""
+	}
+	return stringValue(sender.SenderId.UserId)
+}
+
+func messageSenderOpenID(sender *larkim.EventSender) string {
+	if sender == nil || sender.SenderId == nil {
+		return ""
+	}
+	return stringValue(sender.SenderId.OpenId)
+}
+
+func messageSenderUnionID(sender *larkim.EventSender) string {
+	if sender == nil || sender.SenderId == nil {
+		return ""
+	}
+	return stringValue(sender.SenderId.UnionId)
+}
+
+func cardOperatorUserID(event *callback.CardActionTriggerEvent) string {
+	if event == nil || event.Event == nil || event.Event.Operator == nil {
+		return ""
+	}
+	return stringValue(event.Event.Operator.UserID)
+}
+
+func cardOperatorOpenID(event *callback.CardActionTriggerEvent) string {
+	if event == nil || event.Event == nil || event.Event.Operator == nil {
+		return ""
+	}
+	return strings.TrimSpace(event.Event.Operator.OpenID)
+}
+
+func cardOperatorUnionID(_ *callback.CardActionTriggerEvent) string {
+	return ""
 }
 
 func localSlidesPPTXPath(task domain.Task) string {

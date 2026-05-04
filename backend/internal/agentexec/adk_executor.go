@@ -114,7 +114,7 @@ func (e *ADKExecutor) Execute(ctx context.Context, task domain.Task, plan domain
 	}
 
 	planJSON, _ := json.MarshalIndent(plan, "", "  ")
-	log.Println("plan: ", plan)
+	log.Println("json 化后的plan: ", plan)
 	iter := agent.Run(ctx, &adk.AgentInput{Messages: []adk.Message{
 		schema.SystemMessage(adkExecutionPrompt(task, string(planJSON))),
 		schema.UserMessage(fmt.Sprintf("Existing artifact context:\n%s", artifactContext.PromptText())),
@@ -143,7 +143,7 @@ func (e *ADKExecutor) Execute(ctx context.Context, task domain.Task, plan domain
 			finalTexts = append(finalTexts, msg.Content)
 		}
 	}
-
+	println("llm agent msg:", finalTexts)
 	if len(finalTexts) > 0 {
 		_ = appendMessage(ctx, e.history, sessionID, "assistant", strings.Join(finalTexts, "\n"), "agent_final")
 	}

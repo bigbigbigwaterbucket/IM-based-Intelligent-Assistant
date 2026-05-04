@@ -129,9 +129,7 @@ func validPlan(plan domain.Plan) bool {
 	}
 	return plan.Summary != "" &&
 		plan.Analysis.Objective != "" &&
-		len(plan.Steps) > 0 &&
-		(!needsDoc || (plan.DocTitle != "" && len(plan.DocumentSections) > 0)) &&
-		(!needsSlides || (plan.SlideTitle != "" && len(plan.Slides) > 0))
+		len(plan.Steps) > 0
 }
 
 func hasDeprecatedTool(plan domain.Plan, tool string) bool {
@@ -153,7 +151,7 @@ func validRevisionPlan(plan domain.Plan, task domain.Task) bool {
 	hasExecutableStep := false
 	for _, step := range plan.Steps {
 		switch step.Tool {
-		case "intent.analyze", "planner.build":
+		case "intent.analyze", "planner.build", "im.fetch_thread":
 		case "doc.update":
 			if task.DocURL == "" && task.DocID == "" {
 				return false
@@ -166,8 +164,6 @@ func validRevisionPlan(plan domain.Plan, task domain.Task) bool {
 			hasExecutableStep = true
 		case "sync.broadcast":
 			hasExecutableStep = true
-		default:
-			return false
 		}
 	}
 	return hasExecutableStep

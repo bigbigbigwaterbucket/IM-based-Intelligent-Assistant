@@ -5,6 +5,8 @@ import (
 	"log"
 	"time"
 
+	"agentpilot/backend/internal/proactive"
+
 	lark "github.com/larksuite/oapi-sdk-go/v3"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
@@ -28,6 +30,10 @@ func New(config Config, launcher TaskLauncher) (*Bot, error) {
 	client := lark.NewClient(config.AppID, config.AppSecret)
 	messenger := NewSDKMessenger(client)
 	handler := NewHandler(launcher, messenger, config.PublicBaseURL)
+	handler.SetBotIdentity(config.AppID)
+	proactiveConfig := proactive.ConfigFromEnv()
+	proactiveConfig.Enabled = config.ProactiveEnabled
+	handler.SetProactiveDetector(proactiveConfig, proactive.NewDetector(proactiveConfig, nil))
 	if err := handler.validate(); err != nil {
 		return nil, err
 	}

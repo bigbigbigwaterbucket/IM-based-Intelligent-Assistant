@@ -13,6 +13,7 @@ type Config struct {
 	VerificationToken string
 	EventEncryptKey   string
 	PublicBaseURL     string
+	ProactiveEnabled  bool
 }
 
 func ConfigFromEnv() Config {
@@ -23,6 +24,7 @@ func ConfigFromEnv() Config {
 		VerificationToken: os.Getenv("FEISHU_VERIFICATION_TOKEN"),
 		EventEncryptKey:   os.Getenv("FEISHU_EVENT_ENCRYPT_KEY"),
 		PublicBaseURL:     strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
+		ProactiveEnabled:  strings.EqualFold(os.Getenv("ENABLE_PROACTIVE_DETECTION"), "true") || os.Getenv("ENABLE_PROACTIVE_DETECTION") == "1",
 	}
 }
 

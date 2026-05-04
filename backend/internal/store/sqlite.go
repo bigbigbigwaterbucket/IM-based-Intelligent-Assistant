@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"agentpilot/backend/internal/domain"
@@ -31,6 +32,20 @@ type ActiveTaskRepository interface {
 	ListIdleWaitingTasks(ctx context.Context, cutoff time.Time) ([]domain.Task, error)
 }
 
+type ChatMessageRepository interface {
+	AppendChatMessage(ctx context.Context, message domain.ChatMessage, keepLimit int) error
+	ListRecentChatMessages(ctx context.Context, chatID string, limit int) ([]domain.ChatMessage, error)
+	ConsumeChatMessages(ctx context.Context, chatID, throughMessageID string) error
+}
+
+type ProactiveCandidateRepository interface {
+	CreateProactiveCandidate(ctx context.Context, candidate domain.ProactiveCandidate) (domain.ProactiveCandidate, error)
+	GetProactiveCandidate(ctx context.Context, candidateID string) (domain.ProactiveCandidate, error)
+	UpdateProactiveCandidateStatus(ctx context.Context, candidateID string, status domain.ProactiveCandidateStatus) (domain.ProactiveCandidate, error)
+	HasRecentProactiveCandidate(ctx context.Context, chatID, themeKey string, since time.Time) (bool, error)
+	LatestProactiveThemeKey(ctx context.Context, chatID string) (string, error)
+}
+
 type SQLiteStore struct {
 	db *sql.DB
 }
@@ -53,6 +68,9 @@ func (s *SQLiteStore) migrate() error {
 			chat_id TEXT NOT NULL DEFAULT '',
 			thread_id TEXT NOT NULL DEFAULT '',
 			message_id TEXT NOT NULL DEFAULT '',
+			initiator_user_id TEXT NOT NULL DEFAULT '',
+			initiator_open_id TEXT NOT NULL DEFAULT '',
+			initiator_union_id TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL,
 			current_step TEXT NOT NULL,
 			progress_text TEXT NOT NULL,
@@ -113,6 +131,35 @@ func (s *SQLiteStore) migrate() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_tool_invocations_session
 			ON tool_invocations(session_id, started_at);
+		CREATE TABLE IF NOT EXISTS chat_message_cache (
+			message_id TEXT PRIMARY KEY,
+			chat_id TEXT NOT NULL,
+			thread_id TEXT NOT NULL DEFAULT '',
+			sender_user_id TEXT NOT NULL DEFAULT '',
+			sender_open_id TEXT NOT NULL DEFAULT '',
+			sender_union_id TEXT NOT NULL DEFAULT '',
+			content TEXT NOT NULL,
+			chat_type TEXT NOT NULL DEFAULT '',
+			created_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_chat_message_cache_chat_created
+			ON chat_message_cache(chat_id, created_at);
+		CREATE TABLE IF NOT EXISTS proactive_candidates (
+			candidate_id TEXT PRIMARY KEY,
+			chat_id TEXT NOT NULL,
+			thread_id TEXT NOT NULL DEFAULT '',
+			source_message_id TEXT NOT NULL DEFAULT '',
+			title TEXT NOT NULL,
+			instruction TEXT NOT NULL,
+			context_json TEXT NOT NULL DEFAULT '',
+			theme_key TEXT NOT NULL,
+			status TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_proactive_candidates_chat_theme
+			ON proactive_candidates(chat_id, theme_key, created_at);
 	`); err != nil {
 		return err
 	}
@@ -123,6 +170,9 @@ func (s *SQLiteStore) migrate() error {
 		{name: "chat_id", ddl: "ALTER TABLE tasks ADD COLUMN chat_id TEXT NOT NULL DEFAULT ''"},
 		{name: "thread_id", ddl: "ALTER TABLE tasks ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''"},
 		{name: "message_id", ddl: "ALTER TABLE tasks ADD COLUMN message_id TEXT NOT NULL DEFAULT ''"},
+		{name: "initiator_user_id", ddl: "ALTER TABLE tasks ADD COLUMN initiator_user_id TEXT NOT NULL DEFAULT ''"},
+		{name: "initiator_open_id", ddl: "ALTER TABLE tasks ADD COLUMN initiator_open_id TEXT NOT NULL DEFAULT ''"},
+		{name: "initiator_union_id", ddl: "ALTER TABLE tasks ADD COLUMN initiator_union_id TEXT NOT NULL DEFAULT ''"},
 		{name: "doc_id", ddl: "ALTER TABLE tasks ADD COLUMN doc_id TEXT NOT NULL DEFAULT ''"},
 		{name: "doc_artifact_path", ddl: "ALTER TABLE tasks ADD COLUMN doc_artifact_path TEXT NOT NULL DEFAULT ''"},
 		{name: "slides_artifact_path", ddl: "ALTER TABLE tasks ADD COLUMN slides_artifact_path TEXT NOT NULL DEFAULT ''"},
@@ -151,14 +201,14 @@ func (s *SQLiteStore) Create(ctx context.Context, task domain.Task) (domain.Task
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO tasks (
 			task_id, title, user_instruction, source, status, current_step, progress_text,
-			chat_id, thread_id, message_id,
+			chat_id, thread_id, message_id, initiator_user_id, initiator_open_id, initiator_union_id,
 			doc_url, slides_url, doc_id, doc_artifact_path, slides_artifact_path,
 			summary, requires_action, error_message, version,
 			last_actor, last_interaction_at, idle_prompted_at, created_at, updated_at, steps_json
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		task.TaskID, task.Title, task.UserInstruction, task.Source, task.Status, task.CurrentStep, task.ProgressText,
-		task.ChatID, task.ThreadID, task.MessageID,
+		task.ChatID, task.ThreadID, task.MessageID, task.InitiatorUserID, task.InitiatorOpenID, task.InitiatorUnionID,
 		task.DocURL, task.SlidesURL, task.DocID, task.DocArtifactPath, task.SlidesArtifactPath,
 		task.Summary, boolToInt(task.RequiresAction), task.ErrorMessage, task.Version,
 		task.LastActor, formatTimePtr(task.LastInteractionAt), formatTimePtr(task.IdlePromptedAt),
@@ -179,7 +229,7 @@ func (s *SQLiteStore) Update(ctx context.Context, task domain.Task) (domain.Task
 	result, err := s.db.ExecContext(ctx, `
 		UPDATE tasks
 		SET title = ?, user_instruction = ?, source = ?, status = ?, current_step = ?, progress_text = ?,
-			chat_id = ?, thread_id = ?, message_id = ?,
+			chat_id = ?, thread_id = ?, message_id = ?, initiator_user_id = ?, initiator_open_id = ?, initiator_union_id = ?,
 			doc_url = ?, slides_url = ?, doc_id = ?, doc_artifact_path = ?, slides_artifact_path = ?,
 			summary = ?, requires_action = ?, error_message = ?,
 			version = ?, last_actor = ?, last_interaction_at = ?, idle_prompted_at = ?,
@@ -187,7 +237,7 @@ func (s *SQLiteStore) Update(ctx context.Context, task domain.Task) (domain.Task
 		WHERE task_id = ?
 	`,
 		task.Title, task.UserInstruction, task.Source, task.Status, task.CurrentStep, task.ProgressText,
-		task.ChatID, task.ThreadID, task.MessageID,
+		task.ChatID, task.ThreadID, task.MessageID, task.InitiatorUserID, task.InitiatorOpenID, task.InitiatorUnionID,
 		task.DocURL, task.SlidesURL, task.DocID, task.DocArtifactPath, task.SlidesArtifactPath,
 		task.Summary, boolToInt(task.RequiresAction), task.ErrorMessage,
 		task.Version, task.LastActor, formatTimePtr(task.LastInteractionAt), formatTimePtr(task.IdlePromptedAt),
@@ -207,7 +257,7 @@ func (s *SQLiteStore) Update(ctx context.Context, task domain.Task) (domain.Task
 func (s *SQLiteStore) Get(ctx context.Context, taskID string) (domain.Task, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT task_id, title, user_instruction, source, status, current_step, progress_text,
-			chat_id, thread_id, message_id,
+			chat_id, thread_id, message_id, initiator_user_id, initiator_open_id, initiator_union_id,
 			doc_url, slides_url, doc_id, doc_artifact_path, slides_artifact_path,
 			summary, requires_action, error_message, version,
 			last_actor, last_interaction_at, idle_prompted_at, created_at, updated_at, steps_json
@@ -220,7 +270,7 @@ func (s *SQLiteStore) Get(ctx context.Context, taskID string) (domain.Task, erro
 func (s *SQLiteStore) List(ctx context.Context) ([]domain.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT task_id, title, user_instruction, source, status, current_step, progress_text,
-			chat_id, thread_id, message_id,
+			chat_id, thread_id, message_id, initiator_user_id, initiator_open_id, initiator_union_id,
 			doc_url, slides_url, doc_id, doc_artifact_path, slides_artifact_path,
 			summary, requires_action, error_message, version,
 			last_actor, last_interaction_at, idle_prompted_at, created_at, updated_at, steps_json
@@ -280,7 +330,7 @@ func (s *SQLiteStore) GetSession(ctx context.Context, sessionID string) (domain.
 func (s *SQLiteStore) FindActiveTaskBySession(ctx context.Context, sessionID string) (domain.Task, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT t.task_id, t.title, t.user_instruction, t.source, t.status, t.current_step, t.progress_text,
-			t.chat_id, t.thread_id, t.message_id,
+			t.chat_id, t.thread_id, t.message_id, t.initiator_user_id, t.initiator_open_id, t.initiator_union_id,
 			t.doc_url, t.slides_url, t.doc_id, t.doc_artifact_path, t.slides_artifact_path,
 			t.summary, t.requires_action, t.error_message, t.version,
 			t.last_actor, t.last_interaction_at, t.idle_prompted_at, t.created_at, t.updated_at, t.steps_json
@@ -297,7 +347,7 @@ func (s *SQLiteStore) FindActiveTaskBySession(ctx context.Context, sessionID str
 func (s *SQLiteStore) ListIdleWaitingTasks(ctx context.Context, cutoff time.Time) ([]domain.Task, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT task_id, title, user_instruction, source, status, current_step, progress_text,
-			chat_id, thread_id, message_id,
+			chat_id, thread_id, message_id, initiator_user_id, initiator_open_id, initiator_union_id,
 			doc_url, slides_url, doc_id, doc_artifact_path, slides_artifact_path,
 			summary, requires_action, error_message, version,
 			last_actor, last_interaction_at, idle_prompted_at, created_at, updated_at, steps_json
@@ -388,6 +438,189 @@ func (s *SQLiteStore) ListMessages(ctx context.Context, sessionID string, limit 
 	return messages, nil
 }
 
+func (s *SQLiteStore) AppendChatMessage(ctx context.Context, message domain.ChatMessage, keepLimit int) error {
+	if keepLimit <= 0 {
+		keepLimit = 30
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO chat_message_cache (
+			message_id, chat_id, thread_id, sender_user_id, sender_open_id, sender_union_id,
+			content, chat_type, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(message_id) DO UPDATE SET
+			chat_id = excluded.chat_id,
+			thread_id = excluded.thread_id,
+			sender_user_id = excluded.sender_user_id,
+			sender_open_id = excluded.sender_open_id,
+			sender_union_id = excluded.sender_union_id,
+			content = excluded.content,
+			chat_type = excluded.chat_type,
+			created_at = excluded.created_at
+	`,
+		message.MessageID, message.ChatID, message.ThreadID, message.SenderUserID, message.SenderOpenID, message.SenderUnionID,
+		message.Content, message.ChatType, message.CreatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		DELETE FROM chat_message_cache
+		WHERE chat_id = ?
+			AND message_id NOT IN (
+				SELECT message_id
+				FROM chat_message_cache
+				WHERE chat_id = ?
+				ORDER BY created_at DESC
+				LIMIT ?
+			)
+	`, message.ChatID, message.ChatID, keepLimit)
+	return err
+}
+
+func (s *SQLiteStore) ListRecentChatMessages(ctx context.Context, chatID string, limit int) ([]domain.ChatMessage, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT message_id, chat_id, thread_id, sender_user_id, sender_open_id, sender_union_id,
+			content, chat_type, created_at
+		FROM chat_message_cache
+		WHERE chat_id = ?
+		ORDER BY created_at DESC
+		LIMIT ?
+	`, chatID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	reversed := make([]domain.ChatMessage, 0, limit)
+	for rows.Next() {
+		var message domain.ChatMessage
+		var createdAt string
+		if err := rows.Scan(
+			&message.MessageID, &message.ChatID, &message.ThreadID, &message.SenderUserID, &message.SenderOpenID, &message.SenderUnionID,
+			&message.Content, &message.ChatType, &createdAt,
+		); err != nil {
+			return nil, err
+		}
+		message.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+		reversed = append(reversed, message)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	messages := make([]domain.ChatMessage, len(reversed))
+	for i := range reversed {
+		messages[len(reversed)-1-i] = reversed[i]
+	}
+	return messages, nil
+}
+
+func (s *SQLiteStore) ConsumeChatMessages(ctx context.Context, chatID, throughMessageID string) error {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return nil
+	}
+	throughMessageID = strings.TrimSpace(throughMessageID)
+	if throughMessageID == "" {
+		_, err := s.db.ExecContext(ctx, `DELETE FROM chat_message_cache WHERE chat_id = ?`, chatID)
+		return err
+	}
+
+	var cutoff string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT created_at
+		FROM chat_message_cache
+		WHERE chat_id = ? AND message_id = ?
+	`, chatID, throughMessageID).Scan(&cutoff)
+	if errors.Is(err, sql.ErrNoRows) {
+		_, err = s.db.ExecContext(ctx, `DELETE FROM chat_message_cache WHERE chat_id = ?`, chatID)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+		DELETE FROM chat_message_cache
+		WHERE chat_id = ? AND created_at <= ?
+	`, chatID, cutoff)
+	return err
+}
+
+func (s *SQLiteStore) CreateProactiveCandidate(ctx context.Context, candidate domain.ProactiveCandidate) (domain.ProactiveCandidate, error) {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO proactive_candidates (
+			candidate_id, chat_id, thread_id, source_message_id, title, instruction,
+			context_json, theme_key, status, expires_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`,
+		candidate.CandidateID, candidate.ChatID, candidate.ThreadID, candidate.SourceMessageID, candidate.Title, candidate.Instruction,
+		candidate.ContextJSON, candidate.ThemeKey, candidate.Status,
+		candidate.ExpiresAt.Format(time.RFC3339Nano), candidate.CreatedAt.Format(time.RFC3339Nano), candidate.UpdatedAt.Format(time.RFC3339Nano),
+	)
+	if err != nil {
+		return domain.ProactiveCandidate{}, err
+	}
+	return candidate, nil
+}
+
+func (s *SQLiteStore) GetProactiveCandidate(ctx context.Context, candidateID string) (domain.ProactiveCandidate, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT candidate_id, chat_id, thread_id, source_message_id, title, instruction,
+			context_json, theme_key, status, expires_at, created_at, updated_at
+		FROM proactive_candidates
+		WHERE candidate_id = ?
+	`, candidateID)
+	return scanProactiveCandidate(row)
+}
+
+func (s *SQLiteStore) UpdateProactiveCandidateStatus(ctx context.Context, candidateID string, status domain.ProactiveCandidateStatus) (domain.ProactiveCandidate, error) {
+	now := time.Now()
+	result, err := s.db.ExecContext(ctx, `
+		UPDATE proactive_candidates
+		SET status = ?, updated_at = ?
+		WHERE candidate_id = ?
+	`, status, now.Format(time.RFC3339Nano), candidateID)
+	if err != nil {
+		return domain.ProactiveCandidate{}, err
+	}
+	count, _ := result.RowsAffected()
+	if count == 0 {
+		return domain.ProactiveCandidate{}, errors.New("proactive candidate not found")
+	}
+	return s.GetProactiveCandidate(ctx, candidateID)
+}
+
+func (s *SQLiteStore) HasRecentProactiveCandidate(ctx context.Context, chatID, themeKey string, since time.Time) (bool, error) {
+	var count int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*)
+		FROM proactive_candidates
+		WHERE chat_id = ?
+			AND theme_key = ?
+			AND created_at >= ?
+			AND status IN (?, ?, ?)
+	`, chatID, themeKey, since.Format(time.RFC3339Nano), domain.CandidatePending, domain.CandidateConfirmed, domain.CandidateIgnored).Scan(&count)
+	return count > 0, err
+}
+
+func (s *SQLiteStore) LatestProactiveThemeKey(ctx context.Context, chatID string) (string, error) {
+	var themeKey string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT theme_key
+		FROM proactive_candidates
+		WHERE chat_id = ?
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, chatID).Scan(&themeKey)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return themeKey, err
+}
+
 type scanner interface {
 	Scan(dest ...any) error
 }
@@ -404,7 +637,7 @@ func scanTask(row scanner) (domain.Task, error) {
 	)
 	err := row.Scan(
 		&task.TaskID, &task.Title, &task.UserInstruction, &task.Source, &task.Status, &task.CurrentStep, &task.ProgressText,
-		&task.ChatID, &task.ThreadID, &task.MessageID,
+		&task.ChatID, &task.ThreadID, &task.MessageID, &task.InitiatorUserID, &task.InitiatorOpenID, &task.InitiatorUnionID,
 		&task.DocURL, &task.SlidesURL, &task.DocID, &task.DocArtifactPath, &task.SlidesArtifactPath,
 		&task.Summary, &requiresFlag, &task.ErrorMessage, &task.Version,
 		&task.LastActor, &lastInteractionAt, &idlePromptedAt, &createdAt, &updatedAt, &stepsJSON,
@@ -420,6 +653,25 @@ func scanTask(row scanner) (domain.Task, error) {
 	task.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
 	_ = json.Unmarshal([]byte(stepsJSON), &task.Steps)
 	return task, nil
+}
+
+func scanProactiveCandidate(row scanner) (domain.ProactiveCandidate, error) {
+	var candidate domain.ProactiveCandidate
+	var expiresAt string
+	var createdAt string
+	var updatedAt string
+	err := row.Scan(
+		&candidate.CandidateID, &candidate.ChatID, &candidate.ThreadID, &candidate.SourceMessageID,
+		&candidate.Title, &candidate.Instruction, &candidate.ContextJSON, &candidate.ThemeKey, &candidate.Status,
+		&expiresAt, &createdAt, &updatedAt,
+	)
+	if err != nil {
+		return domain.ProactiveCandidate{}, err
+	}
+	candidate.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expiresAt)
+	candidate.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	candidate.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	return candidate, nil
 }
 
 func (s *SQLiteStore) hasColumn(table, column string) (bool, error) {
