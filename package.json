@@ -8,8 +8,11 @@
   "scripts": {
     "dev:desktop": "npm run dev -w @agent-pilot/desktop",
     "dev:mobile": "npm run dev -w @agent-pilot/mobile",
+    "dev:mobile-rn": "npm run start -w @agent-pilot/mobile-rn --",
     "build:desktop": "npm run build -w @agent-pilot/desktop",
     "build:mobile": "npm run build -w @agent-pilot/mobile",
+    "android:mobile-rn": "npm run android -w @agent-pilot/mobile-rn",
+    "ios:mobile-rn": "npm run ios -w @agent-pilot/mobile-rn",
     "typecheck": "npm run typecheck --workspaces"
   }
 }

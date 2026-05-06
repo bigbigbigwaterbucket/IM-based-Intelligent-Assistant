@@ -12,6 +12,7 @@ import {
   taskStatusLabel,
 } from "@agent-pilot/shared";
 import { connectEvents, listTasks, sendTaskAction } from "./api";
+import { MarkdownEditor } from "./MarkdownEditor";
 
 const clientId = `mobile-${Math.random().toString(36).slice(2)}`;
 const cacheKey = "agent-pilot.mobile.tasks.v1";
@@ -158,6 +159,8 @@ export function App() {
               演示稿：{selectedTask.slidesUrl || "未生成"}
             </a>
           </div>
+
+          <MarkdownEditor taskId={selectedTask.taskId} clientId={clientId} />
 
           <div className="step-list">
             <h3>执行步骤</h3>

@@ -1,0 +1,29 @@
+{
+  "name": "@agent-pilot/mobile-rn",
+  "version": "0.1.0",
+  "main": "index.ts",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@agent-pilot/shared": "0.1.0",
+    "base-64": "^1.0.0",
+    "expo": "~54.0.33",
+    "expo-dev-client": "~6.0.21",
+    "expo-status-bar": "~3.0.9",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-get-random-values": "^2.0.0",
+    "yjs": "^13.6.27"
+  },
+  "devDependencies": {
+    "@types/base-64": "^1.0.2",
+    "@types/react": "~19.1.0",
+    "typescript": "~5.9.2"
+  },
+  "private": true
+}

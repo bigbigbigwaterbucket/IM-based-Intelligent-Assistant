@@ -68,6 +68,48 @@ export interface TaskCreateRequest {
   source?: "desktop" | "mobile";
 }
 
+export interface CollabDocument {
+  docKey: string;
+  taskId: string;
+  kind: "markdown";
+  title: string;
+  sourcePath?: string;
+  snapshotSeq: number;
+  snapshotUpdateBase64?: string;
+  markdownCache: string;
+  editable: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CollabState {
+  docKey: string;
+  snapshotSeq: number;
+  snapshotUpdateBase64?: string;
+}
+
+export interface CollabUpdate {
+  docKey: string;
+  seq: number;
+  clientId: string;
+  updateBase64: string;
+  createdAt: string;
+}
+
+export interface CollabSnapshotRequest {
+  baseSeq: number;
+  snapshotUpdateBase64: string;
+  markdownCache: string;
+  clientId: string;
+}
+
+export interface CollabExportRequest {
+  markdown: string;
+  baseSeq: number;
+  snapshotUpdateBase64: string;
+  clientId: string;
+}
+
 export interface EventEnvelope<T = unknown> {
   eventType: EventType;
   taskId: string;
@@ -210,6 +252,17 @@ export function saveCachedTasks(cacheKey: string, tasks: Task[]): void {
   }
   localStorage.setItem(cacheKey, JSON.stringify(sortTasks(tasks)));
 }
+
+export {
+  base64ToBytes,
+  bytesToBase64,
+  createMarkdownCollabSession,
+} from "./collab";
+export type {
+  CollabSocketUpdate,
+  CollabTransport,
+  MarkdownCollabSession,
+} from "./collab";
 
 function normalizeStep(step: StepRecord): StepRecord | null {
   if (!step || typeof step !== "object" || !step.id) {

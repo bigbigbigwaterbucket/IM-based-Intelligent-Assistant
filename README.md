@@ -7,6 +7,7 @@ Monorepo for the initial desktop + backend + mobile H5 implementation of the IM-
 - `backend`: Go API server, orchestrator, task state hub, and tool runners
 - `apps/desktop`: Electron + React desktop workbench
 - `apps/mobile`: React H5 mobile task board
+- `apps/mobile-rn`: Expo React Native mobile task board
 - `packages/shared`: Shared TypeScript task/event contracts
 
 ## Current MVP
@@ -32,7 +33,16 @@ go run ./cmd/server
 npm install
 npm run dev:desktop
 npm run dev:mobile
+npm run dev:mobile-rn
 npm run desktop -w @agent-pilot/desktop
+```
+
+For React Native on a real device or emulator, configure the backend with a LAN-reachable host instead of `localhost`:
+
+```powershell
+$env:EXPO_PUBLIC_API_BASE="http://10.0.2.2:8080"
+$env:EXPO_PUBLIC_WS_BASE="ws://10.0.2.2:8080"
+npm run dev:mobile-rn
 ```
 
 ## Environment

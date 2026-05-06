@@ -12,6 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"agentpilot/backend/internal/agentexec"
+	"agentpilot/backend/internal/collab"
 	"agentpilot/backend/internal/config"
 	"agentpilot/backend/internal/larkbot"
 	"agentpilot/backend/internal/orchestrator"
@@ -51,6 +52,10 @@ func NewServer() (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	collabService, err := collab.NewService(db, taskStore)
+	if err != nil {
+		return nil, fmt.Errorf("create collab service: %w", err)
+	}
 
 	hub := statehub.NewHub()
 	planSvc := planner.NewService()
@@ -61,6 +66,7 @@ func NewServer() (*Server, error) {
 		FeishuDocBaseURL:  os.Getenv("FEISHU_DOC_BASE_URL"),
 		ArtifactDir:       envOrDefault("ARTIFACT_DIR", tools.ArtifactDir()),
 	})
+	collabService.SetArtifactDir(envOrDefault("ARTIFACT_DIR", tools.ArtifactDir()))
 	orch := orchestrator.New(taskStore, hub, planSvc, toolRunner)
 	history, _ := any(taskStore).(store.HistoryRepository)
 	if einoExecutor, enabled, err := agentexec.NewADKExecutorFromEnv(context.Background(), toolRunner, orch, history); err != nil {
@@ -83,7 +89,7 @@ func NewServer() (*Server, error) {
 	}
 
 	mux := http.NewServeMux()
-	registerRoutes(mux, orch, hub, taskStore)
+	registerRoutes(mux, orch, hub, taskStore, collabService)
 
 	return &Server{
 		addr:     ":" + port,
@@ -106,7 +112,7 @@ func (s *Server) Close() {
 	}
 }
 
-func registerRoutes(mux *http.ServeMux, orch *orchestrator.Service, hub *statehub.Hub, taskStore store.TaskRepository) {
+func registerRoutes(mux *http.ServeMux, orch *orchestrator.Service, hub *statehub.Hub, taskStore store.TaskRepository, collabService *collab.Service) {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -170,6 +176,16 @@ func registerRoutes(mux *http.ServeMux, orch *orchestrator.Service, hub *statehu
 			return
 		}
 
+		if len(parts) == 3 && parts[1] == "documents" && parts[2] == "markdown" && r.Method == http.MethodGet {
+			doc, err := collabService.EnsureMarkdownDocument(r.Context(), taskID)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, doc)
+			return
+		}
+
 		if len(parts) == 2 && parts[1] == "actions" && r.Method == http.MethodPost {
 			var req orchestrator.ActionInput
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -189,6 +205,7 @@ func registerRoutes(mux *http.ServeMux, orch *orchestrator.Service, hub *statehu
 	})
 
 	mux.Handle("/ws", hub.Handler())
+	collabService.RegisterRoutes(mux)
 	mux.Handle("/artifacts/", http.StripPrefix("/artifacts/", http.FileServer(http.Dir(envOrDefault("ARTIFACT_DIR", tools.ArtifactDir())))))
 }
 

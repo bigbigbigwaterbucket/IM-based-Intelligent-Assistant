@@ -11,7 +11,8 @@ import {
   stepStatusLabel,
   taskStatusLabel,
 } from "@agent-pilot/shared";
-import { connectEvents, createTask, listTasks, sendTaskAction } from "./api";
+import { connectEvents, listTasks, sendTaskAction } from "./api";
+import { MarkdownEditor } from "./MarkdownEditor";
 
 const clientId = `desktop-${Math.random().toString(36).slice(2)}`;
 const cacheKey = "agent-pilot.desktop.tasks.v1";
@@ -25,11 +26,7 @@ export function App() {
   );
   const [lastSyncAt, setLastSyncAt] = useState<string>();
   const [errorMessage, setErrorMessage] = useState("");
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [title, setTitle] = useState("Agent-Pilot 方案汇报");
-  const [instruction, setInstruction] = useState(
-    "从 IM 讨论中整理需求背景、技术方案和演示稿结构，生成可用于评审的文档与演示材料。",
-  );
+  const [isEditorOpen, setIsEditorOpen] = useState(false);
 
   const commitTasks = useCallback((mutate: (current: Task[]) => Task[]) => {
     setTasks((current) => {
@@ -103,23 +100,6 @@ export function App() {
 
   const isOnline = connectionStatus === "online";
 
-  async function onSubmit() {
-    if (!title.trim() || !instruction.trim() || !isOnline) {
-      return;
-    }
-    setIsSubmitting(true);
-    setErrorMessage("");
-    try {
-      const task = await createTask({ title: title.trim(), instruction: instruction.trim(), source: "desktop" });
-      commitTasks((current) => mergeTask(current, task));
-      setSelectedId(task.taskId);
-    } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "创建任务失败");
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
-
   async function onAction(actionType: ActionType) {
     if (!selectedTask) {
       return;
@@ -165,24 +145,6 @@ export function App() {
           <small>{lastSyncAt ? `最近同步 ${formatTaskTime(lastSyncAt)}` : "等待同步"}</small>
         </div>
 
-        <section className="composer">
-          <div className="section-title">
-            <h2>发起任务</h2>
-            <span>IM / Doc / Slides</span>
-          </div>
-          <label>
-            <span>标题</span>
-            <input value={title} onChange={(event) => setTitle(event.target.value)} />
-          </label>
-          <label>
-            <span>自然语言指令</span>
-            <textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} rows={5} />
-          </label>
-          <button className="primary-button" onClick={onSubmit} disabled={!isOnline || isSubmitting}>
-            {isSubmitting ? "创建中" : "创建 Agent Task"}
-          </button>
-        </section>
-
         <section className="task-nav">
           <div className="section-title">
             <h2>任务</h2>
@@ -225,38 +187,21 @@ export function App() {
 
         {selectedTask ? (
           <>
-            <section className="task-hero">
-              <div>
-                <span className="eyebrow">Agent Task</span>
-                <h2>{selectedTask.title}</h2>
-                <p>{selectedTask.userInstruction}</p>
+            <section className="task-focus">
+              <div className="task-strip">
+                <div>
+                  <span className="eyebrow">Agent Task</span>
+                  <h2>{selectedTask.title}</h2>
+                  <p>{selectedTask.userInstruction}</p>
+                </div>
+                <div className="hero-meta">
+                  <span className={`status-pill status-${selectedTask.status}`}>{taskStatusLabel[selectedTask.status]}</span>
+                  <strong>{getTaskProgress(selectedTask)}%</strong>
+                  <small>v{selectedTask.version} · {selectedTask.lastActor}</small>
+                </div>
               </div>
-              <div className="hero-meta">
-                <span className={`status-pill status-${selectedTask.status}`}>{taskStatusLabel[selectedTask.status]}</span>
-                <strong>{getTaskProgress(selectedTask)}%</strong>
-                <small>v{selectedTask.version} · {selectedTask.lastActor}</small>
-              </div>
-            </section>
 
-            <section className="overview-grid">
-              <div className="metric">
-                <span>当前步骤</span>
-                <strong>{selectedTask.currentStep || "-"}</strong>
-              </div>
-              <div className="metric">
-                <span>步骤进度</span>
-                <strong>
-                  {selectedTask.steps.filter((step) => step.status === "completed").length}/{selectedTask.steps.length}
-                </strong>
-              </div>
-              <div className="metric">
-                <span>更新时间</span>
-                <strong>{formatTaskTime(selectedTask.updatedAt)}</strong>
-              </div>
-            </section>
-
-            <section className="detail-grid">
-              <div className="surface run-panel">
+              <section className="surface run-panel">
                 <div className="section-title">
                   <h2>执行链路</h2>
                   <span>{selectedTask.progressText || "等待状态更新"}</span>
@@ -283,9 +228,9 @@ export function App() {
                     <p className="empty-text">Plan 生成后会在这里展示每个 step 的状态。</p>
                   )}
                 </div>
-              </div>
+              </section>
 
-              <aside className="side-panel">
+              <div className="output-grid">
                 <section className="surface">
                   <div className="section-title">
                     <h2>Agent 输出</h2>
@@ -311,22 +256,28 @@ export function App() {
                     <button onClick={() => void onAction("retry_task")} disabled={!isOnline || selectedTask.status !== "failed"}>
                       重试
                     </button>
-                    <button
-                      onClick={() => void onAction("approve_continue")}
-                      disabled={!isOnline || !selectedTask.requiresAction}
-                    >
+                    <button onClick={() => void onAction("approve_continue")} disabled={!isOnline || !selectedTask.requiresAction}>
                       继续
                     </button>
-                    <button
-                      onClick={() => void onAction("open_artifact")}
-                      disabled={!selectedTask.docUrl && !selectedTask.slidesUrl}
-                    >
-                      打开产物
+                    <button className="edit-markdown-action" onClick={() => setIsEditorOpen(true)}>
+                      编辑 Markdown
                     </button>
                   </div>
                 </section>
-              </aside>
+              </div>
             </section>
+
+            <div className={`editor-drawer ${isEditorOpen ? "open" : ""}`} aria-hidden={!isEditorOpen}>
+              <div className="drawer-header">
+                <div>
+                  <span className="eyebrow">Markdown</span>
+                  <h2>协同编辑</h2>
+                </div>
+                <button onClick={() => setIsEditorOpen(false)}>关闭</button>
+              </div>
+              <MarkdownEditor taskId={selectedTask.taskId} clientId={clientId} />
+            </div>
+            {isEditorOpen ? <button className="drawer-backdrop" onClick={() => setIsEditorOpen(false)} aria-label="关闭 Markdown 编辑" /> : null}
           </>
         ) : (
           <section className="empty-state">

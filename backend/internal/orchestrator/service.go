@@ -165,7 +165,7 @@ func (s *Service) ContinueTask(ctx context.Context, input ContinueTaskInput) (do
 		current.LastActor = fallback(input.ActorType, "user")
 		current.LastInteractionAt = &now
 		current.IdlePromptedAt = nil
-		current.Steps = append(current.Steps, newStep("revision_request", "Revision request", domain.StepCompleted, revision))
+		current.Steps = append(current.Steps, newStep("revision_request", "任务修订", domain.StepCompleted, revision))
 	})
 	if task.TaskID == "" {
 		return domain.Task{}, errors.New("task state update failed")
@@ -879,9 +879,9 @@ func isLogicalStep(tool string) bool {
 func toolDisplayName(tool string) string {
 	switch tool {
 	case "doc.update":
-		return "Update document"
+		return "更新文档"
 	case "slide.regenerate":
-		return "Regenerate slides"
+		return "更新PPT"
 	case "im.fetch_thread":
 		return "读取 IM 上下文"
 	case "doc.create":

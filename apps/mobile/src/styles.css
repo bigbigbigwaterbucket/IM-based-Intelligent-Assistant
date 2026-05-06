@@ -262,6 +262,90 @@ a {
   padding: 10px 12px;
 }
 
+.mobile-markdown {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #d8e0e8;
+  border-radius: 8px;
+  background: #ffffff;
+  padding: 12px;
+}
+
+.mobile-markdown-title {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.mobile-markdown-title h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+
+.mobile-markdown-title span,
+.mobile-markdown-title strong {
+  color: #667483;
+  font-size: 12px;
+}
+
+.mobile-segment {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+  border-radius: 6px;
+  background: #eef3f8;
+  padding: 4px;
+}
+
+.mobile-segment button {
+  border-radius: 5px;
+  background: transparent;
+  color: #495664;
+  padding: 8px;
+}
+
+.mobile-segment button.selected {
+  background: #ffffff;
+  color: #1769aa;
+  font-weight: 700;
+}
+
+.mobile-markdown-editor,
+.mobile-markdown-preview {
+  min-height: 320px;
+  border: 1px solid #cdd6df;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.mobile-markdown-editor {
+  width: 100%;
+  resize: vertical;
+  padding: 10px;
+  font: 14px/1.55 Consolas, "SFMono-Regular", "Microsoft YaHei UI", monospace;
+}
+
+.mobile-markdown-preview {
+  overflow: auto;
+  padding: 12px;
+  line-height: 1.6;
+}
+
+.mobile-markdown-preview h1,
+.mobile-markdown-preview h2,
+.mobile-markdown-preview p {
+  margin: 0 0 10px;
+}
+
+.mobile-markdown-preview h1 {
+  font-size: 20px;
+}
+
+.mobile-markdown-preview h2 {
+  margin-top: 14px;
+  font-size: 17px;
+}
+
 .artifact-list {
   display: grid;
   gap: 8px;

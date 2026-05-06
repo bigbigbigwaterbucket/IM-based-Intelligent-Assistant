@@ -1,6 +1,7 @@
 import { normalizeTask, normalizeTasks } from "@agent-pilot/shared";
 const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8080";
 const WS_BASE = (import.meta.env.VITE_WS_BASE ?? "ws://localhost:8080") + "/ws";
+const COLLAB_WS_BASE = import.meta.env.VITE_WS_BASE ?? "ws://localhost:8080";
 export async function listTasks() {
     const response = await fetch(`${API_BASE}/tasks`);
     if (!response.ok) {
@@ -42,6 +43,60 @@ export async function sendTaskAction(taskId, payload) {
         throw new Error("Invalid task payload");
     }
     return task;
+}
+export async function loadMarkdownDocument(taskId) {
+    const response = await fetch(`${API_BASE}/tasks/${taskId}/documents/markdown`);
+    if (!response.ok) {
+        throw new Error("Failed to load markdown document");
+    }
+    return (await response.json());
+}
+export async function loadCollabState(docKey) {
+    const response = await fetch(`${API_BASE}/collab/docs/${encodeURIComponent(docKey)}/state`);
+    if (!response.ok) {
+        throw new Error("Failed to load collaborative state");
+    }
+    return (await response.json());
+}
+export async function loadCollabUpdates(docKey, sinceSeq) {
+    const response = await fetch(`${API_BASE}/collab/docs/${encodeURIComponent(docKey)}/updates?sinceSeq=${sinceSeq}`);
+    if (!response.ok) {
+        throw new Error("Failed to load collaborative updates");
+    }
+    const payload = (await response.json());
+    return Array.isArray(payload) ? payload : [];
+}
+export async function saveCollabSnapshot(docKey, payload) {
+    const response = await fetch(`${API_BASE}/collab/docs/${encodeURIComponent(docKey)}/snapshot`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        throw new Error("Failed to save snapshot");
+    }
+    return (await response.json());
+}
+export async function exportCollabMarkdown(docKey, payload) {
+    const response = await fetch(`${API_BASE}/collab/docs/${encodeURIComponent(docKey)}/export`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        throw new Error("Failed to export markdown");
+    }
+    return (await response.json());
+}
+export function connectCollabDoc(docKey, clientId, onUpdate) {
+    const socket = new WebSocket(`${COLLAB_WS_BASE}/collab/docs/${encodeURIComponent(docKey)}/ws?clientId=${encodeURIComponent(clientId)}`);
+    socket.onmessage = (event) => {
+        const message = JSON.parse(event.data);
+        if (message.type === "update" && message.docKey && message.updateBase64 && typeof message.seq === "number" && message.clientId) {
+            onUpdate(message);
+        }
+    };
+    return () => socket.close();
 }
 export function connectEvents(onEvent, onStatus, onReconnect) {
     let socket;

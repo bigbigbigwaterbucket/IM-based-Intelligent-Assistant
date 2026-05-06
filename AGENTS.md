@@ -7,11 +7,10 @@
 - Do not add ad hoc raw HTTP wrappers for Feishu APIs when the SDK exposes the endpoint.
 - If the SDK does not expose a needed Feishu API, keep the fallback local or document the gap explicitly before adding another integration path.
 
-TODO：agent管理整个调用链路、用户上下文session持久化，
+TODO:
 使用new命令可重置上下文、使用skill优化doc文档与ppt文档产出
 意图分析能力、step动态增删（如果群聊消息上下文不够，尝试获取更多消息
 使用飞书卡片优化bot使用引导？
-关于task绑定会话/用户的范围需要仔细思考，如果绑定单个用户，那么协作性较差。如果绑定会话，那么容易混
 /assistant (new) 输入体验不好的问题
 DAG、multi-agent并行完成文档/ppt生成，redis优化
 review是必要的，经常发现ai写的代码不符合实际要求，例如群聊消息没进入agent上下文/任务是更新doc文档但agent没读已有的doc，不review不好看出问题
@@ -32,7 +31,7 @@ IM文件信息获取能力，高级ppt生成能力，高级文档生成能力
 
 启动任务时，发送web dashboard地址方便用户查看进度/在线编辑
 使用Yjs实现多端CRDT
-飞书bot生成的文档可供编辑/ppt文档编辑实现？ 添加同步回系统文件，这样agent才能读到用户的改动
+飞书bot生成的文档可供编辑/ppt文档编辑实现？ 添加同步回系统文件，这样agent才能读到飞书文档用户的改动？
 
 卡片点击end task报错200340
 end task卡片点击后不可再点优化
@@ -40,3 +39,4 @@ https://open.feishu.cn/document/feishu-cards/card-callback-communication#c98c322
 
 主动发起总结
 To continue this session, run codex resume 019de786-0eb3-76b3-bf3d-427dd3059465
+codex resume 019df1a5-85b3-75b0-b776-a44ffce953ed

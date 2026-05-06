@@ -11,12 +11,25 @@ import type {
 } from "@agent-pilot/shared";
 import { normalizeTask, normalizeTasks } from "@agent-pilot/shared";
 
-const API_BASE = import.meta.env.VITE_API_BASE ?? "http://localhost:8080";
-const WS_BASE = (import.meta.env.VITE_WS_BASE ?? "ws://localhost:8080") + "/ws";
-const COLLAB_WS_BASE = import.meta.env.VITE_WS_BASE ?? "ws://localhost:8080";
+const API_BASE = process.env.EXPO_PUBLIC_API_BASE ?? "";
+const WS_BASE = process.env.EXPO_PUBLIC_WS_BASE ?? "";
+
+function requireAPIBase(): string {
+  if (!API_BASE) {
+    throw new Error("请配置 EXPO_PUBLIC_API_BASE，例如 http://192.168.1.20:8080");
+  }
+  return API_BASE.replace(/\/$/, "");
+}
+
+function requireWSBase(): string {
+  if (!WS_BASE) {
+    throw new Error("请配置 EXPO_PUBLIC_WS_BASE，例如 ws://192.168.1.20:8080");
+  }
+  return WS_BASE.replace(/\/$/, "");
+}
 
 export async function listTasks(): Promise<Task[]> {
-  const response = await fetch(`${API_BASE}/tasks`);
+  const response = await fetch(`${requireAPIBase()}/tasks`);
   if (!response.ok) {
     throw new Error("Failed to load tasks");
   }
@@ -24,7 +37,7 @@ export async function listTasks(): Promise<Task[]> {
 }
 
 export async function sendTaskAction(taskId: string, payload: TaskActionRequest): Promise<Task> {
-  const response = await fetch(`${API_BASE}/tasks/${taskId}/actions`, {
+  const response = await fetch(`${requireAPIBase()}/tasks/${taskId}/actions`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -42,7 +55,7 @@ export async function sendTaskAction(taskId: string, payload: TaskActionRequest)
 }
 
 export async function loadMarkdownDocument(taskId: string): Promise<CollabDocument> {
-  const response = await fetch(`${API_BASE}/tasks/${taskId}/documents/markdown`);
+  const response = await fetch(`${requireAPIBase()}/tasks/${taskId}/documents/markdown`);
   if (!response.ok) {
     throw new Error("Failed to load markdown document");
   }
@@ -50,7 +63,7 @@ export async function loadMarkdownDocument(taskId: string): Promise<CollabDocume
 }
 
 export async function loadCollabState(docKey: string): Promise<CollabState> {
-  const response = await fetch(`${API_BASE}/collab/docs/${encodeURIComponent(docKey)}/state`);
+  const response = await fetch(`${requireAPIBase()}/collab/docs/${encodeURIComponent(docKey)}/state`);
   if (!response.ok) {
     throw new Error("Failed to load collaborative state");
   }
@@ -58,7 +71,7 @@ export async function loadCollabState(docKey: string): Promise<CollabState> {
 }
 
 export async function loadCollabUpdates(docKey: string, sinceSeq: number): Promise<CollabUpdate[]> {
-  const response = await fetch(`${API_BASE}/collab/docs/${encodeURIComponent(docKey)}/updates?sinceSeq=${sinceSeq}`);
+  const response = await fetch(`${requireAPIBase()}/collab/docs/${encodeURIComponent(docKey)}/updates?sinceSeq=${sinceSeq}`);
   if (!response.ok) {
     throw new Error("Failed to load collaborative updates");
   }
@@ -67,7 +80,7 @@ export async function loadCollabUpdates(docKey: string, sinceSeq: number): Promi
 }
 
 export async function saveCollabSnapshot(docKey: string, payload: CollabSnapshotRequest): Promise<CollabDocument> {
-  const response = await fetch(`${API_BASE}/collab/docs/${encodeURIComponent(docKey)}/snapshot`, {
+  const response = await fetch(`${requireAPIBase()}/collab/docs/${encodeURIComponent(docKey)}/snapshot`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -79,7 +92,7 @@ export async function saveCollabSnapshot(docKey: string, payload: CollabSnapshot
 }
 
 export async function exportCollabMarkdown(docKey: string, payload: CollabExportRequest): Promise<CollabDocument> {
-  const response = await fetch(`${API_BASE}/collab/docs/${encodeURIComponent(docKey)}/export`, {
+  const response = await fetch(`${requireAPIBase()}/collab/docs/${encodeURIComponent(docKey)}/export`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -90,28 +103,13 @@ export async function exportCollabMarkdown(docKey: string, payload: CollabExport
   return (await response.json()) as CollabDocument;
 }
 
-export function connectCollabDoc(
-  docKey: string,
-  clientId: string,
-  onUpdate: (message: { type: "update"; docKey: string; seq: number; clientId: string; updateBase64: string }) => void,
-): () => void {
-  const socket = new WebSocket(`${COLLAB_WS_BASE}/collab/docs/${encodeURIComponent(docKey)}/ws?clientId=${encodeURIComponent(clientId)}`);
-  socket.onmessage = (event) => {
-    const message = JSON.parse(event.data as string) as { type?: string; docKey?: string; seq?: number; clientId?: string; updateBase64?: string };
-    if (message.type === "update" && message.docKey && message.updateBase64 && typeof message.seq === "number" && message.clientId) {
-      onUpdate(message as { type: "update"; docKey: string; seq: number; clientId: string; updateBase64: string });
-    }
-  };
-  return () => socket.close();
-}
-
 export function connectEvents(
   onEvent: (event: EventEnvelope<Task>) => void,
   onStatus: (status: ConnectionStatus) => void,
   onReconnect?: () => void,
 ): () => void {
   let socket: WebSocket | undefined;
-  let retryTimer: number | undefined;
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let closed = false;
   let attempts = 0;
 
@@ -119,13 +117,16 @@ export function connectEvents(
     if (closed) {
       return;
     }
-    if (typeof navigator !== "undefined" && !navigator.onLine) {
+    let wsURL = "";
+    try {
+      wsURL = `${requireWSBase()}/ws`;
+    } catch {
       onStatus("offline");
       return;
     }
 
     onStatus(attempts === 0 ? "connecting" : "reconnecting");
-    socket = new WebSocket(WS_BASE);
+    socket = new WebSocket(wsURL);
 
     socket.onopen = () => {
       attempts = 0;
@@ -134,7 +135,7 @@ export function connectEvents(
     };
 
     socket.onmessage = (message) => {
-      const event = JSON.parse(message.data) as EventEnvelope<unknown>;
+      const event = JSON.parse(String(message.data)) as EventEnvelope<unknown>;
       const payload = normalizeTask(event?.payload);
       if (!payload) {
         return;
@@ -150,8 +151,8 @@ export function connectEvents(
         return;
       }
       attempts += 1;
-      onStatus(typeof navigator !== "undefined" && !navigator.onLine ? "offline" : "reconnecting");
-      retryTimer = window.setTimeout(connect, Math.min(8000, 1000 * attempts));
+      onStatus("reconnecting");
+      retryTimer = setTimeout(connect, Math.min(8000, 1000 * attempts));
     };
 
     socket.onerror = () => {
@@ -159,27 +160,17 @@ export function connectEvents(
     };
   }
 
-  function handleOffline() {
-    onStatus("offline");
-    socket?.close();
-  }
-
-  function handleOnline() {
-    attempts = 0;
-    connect();
-  }
-
-  window.addEventListener("offline", handleOffline);
-  window.addEventListener("online", handleOnline);
   connect();
 
   return () => {
     closed = true;
     if (retryTimer) {
-      window.clearTimeout(retryTimer);
+      clearTimeout(retryTimer);
     }
-    window.removeEventListener("offline", handleOffline);
-    window.removeEventListener("online", handleOnline);
     socket?.close();
   };
+}
+
+export function collabSocketURL(docKey: string, clientId: string): string {
+  return `${requireWSBase()}/collab/docs/${encodeURIComponent(docKey)}/ws?clientId=${encodeURIComponent(clientId)}`;
 }
