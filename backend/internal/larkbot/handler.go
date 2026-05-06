@@ -315,6 +315,9 @@ func (h *Handler) startedText(task domain.Task) string {
 		"实时查看任务进度/在线编辑文档: http://localhost:5173",
 		"我会在完成后回复汇总结果。",
 	}
+	if owner := ownerMention(task); owner != "" {
+		lines = append(lines, "归属："+owner)
+	}
 	if link := h.taskLink(task.TaskID); link != "" {
 		lines = append(lines, "进度："+link)
 	}
@@ -325,6 +328,9 @@ func (h *Handler) revisionStartedText(task domain.Task) string {
 	lines := []string{
 		fmt.Sprintf("Assistant任务更新：%s", task.TaskID),
 		"我会更新现有产物，并在完成后回复。",
+	}
+	if owner := ownerMention(task); owner != "" {
+		lines = append(lines, "归属："+owner)
 	}
 	if link := h.taskLink(task.TaskID); link != "" {
 		lines = append(lines, "进度："+link)
@@ -337,6 +343,24 @@ func (h *Handler) taskLink(taskID string) string {
 		return ""
 	}
 	return h.publicBaseURL + "/?taskId=" + url.QueryEscape(taskID)
+}
+
+func ownerMention(task domain.Task) string {
+	id := strings.TrimSpace(task.InitiatorOpenID)
+	if id == "" {
+		id = strings.TrimSpace(task.InitiatorUserID)
+	}
+	if id == "" {
+		id = strings.TrimSpace(task.InitiatorUnionID)
+	}
+	if id == "" {
+		return ""
+	}
+	return fmt.Sprintf(`<at user_id="%s">Owner</at>`, escapeAtUserID(id))
+}
+
+func escapeAtUserID(value string) string {
+	return strings.NewReplacer("&", "&amp;", `"`, "&quot;", "<", "&lt;", ">", "&gt;").Replace(value)
 }
 
 func (h *Handler) doneText(task domain.Task) string {

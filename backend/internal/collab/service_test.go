@@ -149,6 +149,172 @@ func TestEnsureMarkdownDocumentCanReadArtifactURL(t *testing.T) {
 	}
 }
 
+func TestEnsureMarkdownDocumentHydratesExistingEmptyDocumentFromToolArtifact(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	taskStore, err := store.NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	service, err := NewService(db, taskStore)
+	if err != nil {
+		t.Fatalf("service: %v", err)
+	}
+
+	now := time.Now()
+	_, err = taskStore.Create(ctx, domain.Task{
+		TaskID:          "task-hydrate",
+		Title:           "Doc",
+		UserInstruction: "write",
+		Source:          "test",
+		Status:          domain.StatusExecuting,
+		CurrentStep:     "doc.generate",
+		ProgressText:    "writing",
+		DocURL:          "https://sample.feishu.cn/docx/doc-token",
+		Version:         1,
+		LastActor:       "test",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	initial, err := service.EnsureMarkdownDocument(ctx, "task-hydrate")
+	if err != nil {
+		t.Fatalf("ensure initial doc: %v", err)
+	}
+	if initial.Editable {
+		t.Fatalf("expected initial empty document to be non-editable")
+	}
+
+	path := filepath.Join(t.TempDir(), "generated.md")
+	if err := os.WriteFile(path, []byte("# Generated\n\nContent"), 0644); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	err = taskStore.AppendToolInvocation(ctx, domain.ToolInvocation{
+		InvocationID:   "invocation-hydrate",
+		SessionID:      "task:task-hydrate",
+		TaskID:         "task-hydrate",
+		StepID:         "doc-step",
+		ToolName:       "doc.generate",
+		ArgumentsJSON:  "{}",
+		ResultSummary:  "created",
+		ResultJSON:     "{}",
+		ArtifactURL:    "https://sample.feishu.cn/docx/doc-token",
+		ArtifactPath:   path,
+		StartedAt:      now.Add(time.Second),
+		CompletedAt:    now.Add(2 * time.Second),
+		DurationMillis: 1000,
+	})
+	if err != nil {
+		t.Fatalf("append invocation: %v", err)
+	}
+
+	hydrated, err := service.EnsureMarkdownDocument(ctx, "task-hydrate")
+	if err != nil {
+		t.Fatalf("ensure hydrated doc: %v", err)
+	}
+	if hydrated.MarkdownCache != "# Generated\n\nContent" {
+		t.Fatalf("expected generated markdown, got %q", hydrated.MarkdownCache)
+	}
+	if hydrated.SourcePath != path {
+		t.Fatalf("unexpected source path: %q", hydrated.SourcePath)
+	}
+	task, err := taskStore.Get(ctx, "task-hydrate")
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if task.DocArtifactPath != path {
+		t.Fatalf("expected task artifact path to be repaired, got %q", task.DocArtifactPath)
+	}
+}
+
+func TestEnsureMarkdownDocumentDoesNotOverwriteExistingCollabEdits(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	taskStore, err := store.NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	service, err := NewService(db, taskStore)
+	if err != nil {
+		t.Fatalf("service: %v", err)
+	}
+
+	now := time.Now()
+	_, err = taskStore.Create(ctx, domain.Task{
+		TaskID:          "task-edited",
+		Title:           "Doc",
+		UserInstruction: "write",
+		Source:          "test",
+		Status:          domain.StatusExecuting,
+		CurrentStep:     "doc.generate",
+		ProgressText:    "writing",
+		DocURL:          "https://sample.feishu.cn/docx/doc-token",
+		Version:         1,
+		LastActor:       "test",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	doc, err := service.EnsureMarkdownDocument(ctx, "task-edited")
+	if err != nil {
+		t.Fatalf("ensure initial doc: %v", err)
+	}
+	_, err = service.SaveSnapshot(ctx, doc.DocKey, SnapshotRequest{
+		BaseSeq:              0,
+		SnapshotUpdateBase64: base64.StdEncoding.EncodeToString([]byte("snapshot")),
+		MarkdownCache:        "# User edit",
+		ClientID:             "client",
+	})
+	if err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "generated.md")
+	if err := os.WriteFile(path, []byte("# Generated"), 0644); err != nil {
+		t.Fatalf("write artifact: %v", err)
+	}
+	err = taskStore.AppendToolInvocation(ctx, domain.ToolInvocation{
+		InvocationID:   "invocation-edited",
+		SessionID:      "task:task-edited",
+		TaskID:         "task-edited",
+		StepID:         "doc-step",
+		ToolName:       "doc.generate",
+		ArgumentsJSON:  "{}",
+		ResultSummary:  "created",
+		ResultJSON:     "{}",
+		ArtifactPath:   path,
+		StartedAt:      now.Add(time.Second),
+		CompletedAt:    now.Add(2 * time.Second),
+		DurationMillis: 1000,
+	})
+	if err != nil {
+		t.Fatalf("append invocation: %v", err)
+	}
+
+	current, err := service.EnsureMarkdownDocument(ctx, "task-edited")
+	if err != nil {
+		t.Fatalf("ensure current doc: %v", err)
+	}
+	if current.MarkdownCache != "# User edit" {
+		t.Fatalf("expected user edit to remain, got %q", current.MarkdownCache)
+	}
+	if current.SourcePath != "" {
+		t.Fatalf("expected source path to remain empty, got %q", current.SourcePath)
+	}
+}
+
 func TestOlderSnapshotIsRejected(t *testing.T) {
 	ctx := context.Background()
 	db, err := sql.Open("sqlite", "file::memory:?cache=shared")

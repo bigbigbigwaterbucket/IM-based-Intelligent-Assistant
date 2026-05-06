@@ -22,7 +22,7 @@ func TestHandleMessageStartsP2PTaskAndRepliesDone(t *testing.T) {
 	t.Parallel()
 
 	launcher := &fakeLauncher{
-		createdTask: domain.Task{TaskID: "task-1", Status: domain.StatusExecuting},
+		createdTask: domain.Task{TaskID: "task-1", Status: domain.StatusExecuting, InitiatorOpenID: "ou_sender"},
 		doneTask: domain.Task{
 			TaskID:    "task-1",
 			Status:    domain.StatusWaitingAction,
@@ -61,6 +61,9 @@ func TestHandleMessageStartsP2PTaskAndRepliesDone(t *testing.T) {
 	replies := strings.Join(messenger.replies(), "\n")
 	if !strings.Contains(replies, "https://dashboard.example/?taskId=task-1") {
 		t.Fatalf("expected dashboard link in replies: %s", replies)
+	}
+	if !strings.Contains(replies, `归属：<at user_id="ou_sender">Owner</at>`) {
+		t.Fatalf("expected owner mention in replies: %s", replies)
 	}
 	if !strings.Contains(replies, "Assistant任务待审核：task-1") {
 		t.Fatalf("expected review reply: %s", replies)

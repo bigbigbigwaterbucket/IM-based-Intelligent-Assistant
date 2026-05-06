@@ -24,6 +24,10 @@ type TaskRepository interface {
 	Update(ctx context.Context, task domain.Task) (domain.Task, error)
 }
 
+type ArtifactRepository interface {
+	LatestDocArtifactPath(ctx context.Context, taskID string) (string, error)
+}
+
 type Document struct {
 	DocKey               string    `json:"docKey"`
 	TaskID               string    `json:"taskId"`
@@ -114,13 +118,13 @@ func (s *Service) EnsureMarkdownDocument(ctx context.Context, taskID string) (Do
 	}
 	docKey := docKeyForTask(taskID)
 	if doc, err := s.getDocument(ctx, docKey); err == nil {
-		return doc, nil
+		return s.hydrateEmptyMarkdownDocument(ctx, task, doc)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return Document{}, err
 	}
 
 	markdown := ""
-	sourcePath := s.markdownSourcePath(task)
+	sourcePath := s.resolveMarkdownSourcePath(ctx, task)
 	if sourcePath != "" {
 		data, readErr := os.ReadFile(sourcePath)
 		if readErr != nil {
@@ -145,6 +149,50 @@ func (s *Service) EnsureMarkdownDocument(ctx context.Context, taskID string) (Do
 		return Document{}, err
 	}
 	return doc, nil
+}
+
+func (s *Service) hydrateEmptyMarkdownDocument(ctx context.Context, task domain.Task, doc Document) (Document, error) {
+	if !s.shouldHydrateMarkdownDocument(ctx, doc) {
+		return doc, nil
+	}
+	sourcePath := s.resolveMarkdownSourcePath(ctx, task)
+	if sourcePath == "" {
+		return doc, nil
+	}
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		return Document{}, fmt.Errorf("read markdown artifact: %w", err)
+	}
+	markdown := string(data)
+	now := time.Now()
+	_, err = s.db.ExecContext(ctx, `
+		UPDATE collab_documents
+		SET source_path = ?, current_markdown_cache = ?, updated_at = ?
+		WHERE doc_key = ?
+	`, sourcePath, markdown, now.Format(time.RFC3339Nano), doc.DocKey)
+	if err != nil {
+		return Document{}, err
+	}
+	if task.DocArtifactPath != sourcePath {
+		task.DocArtifactPath = sourcePath
+		task.Version++
+		task.UpdatedAt = now
+		task.LastActor = "collab"
+		_, _ = s.tasks.Update(ctx, task)
+	}
+	return s.getDocument(ctx, doc.DocKey)
+}
+
+func (s *Service) shouldHydrateMarkdownDocument(ctx context.Context, doc Document) bool {
+	if strings.TrimSpace(doc.SourcePath) != "" || strings.TrimSpace(doc.MarkdownCache) != "" {
+		return false
+	}
+	if doc.SnapshotSeq > 0 || strings.TrimSpace(doc.SnapshotUpdateBase64) != "" {
+		return false
+	}
+	var count int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM collab_updates WHERE doc_key = ?`, doc.DocKey).Scan(&count)
+	return err == nil && count == 0
 }
 
 func (s *Service) State(ctx context.Context, docKey string) (StateResponse, error) {
@@ -598,6 +646,21 @@ func scanUpdate(row scanner) (Update, error) {
 
 func docKeyForTask(taskID string) string {
 	return taskID + ":doc"
+}
+
+func (s *Service) resolveMarkdownSourcePath(ctx context.Context, task domain.Task) string {
+	if path := s.markdownSourcePath(task); path != "" {
+		return path
+	}
+	artifacts, ok := s.tasks.(ArtifactRepository)
+	if !ok {
+		return ""
+	}
+	path, err := artifacts.LatestDocArtifactPath(ctx, task.TaskID)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(path)
 }
 
 func (s *Service) markdownSourcePath(task domain.Task) string {

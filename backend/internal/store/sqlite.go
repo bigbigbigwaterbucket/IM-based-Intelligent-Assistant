@@ -24,6 +24,7 @@ type HistoryRepository interface {
 	GetSession(ctx context.Context, sessionID string) (domain.Session, error)
 	AppendMessage(ctx context.Context, message domain.ConversationMessage) error
 	AppendToolInvocation(ctx context.Context, invocation domain.ToolInvocation) error
+	LatestDocArtifactPath(ctx context.Context, taskID string) (string, error)
 	ListMessages(ctx context.Context, sessionID string, limit int) ([]domain.ConversationMessage, error)
 }
 
@@ -399,6 +400,23 @@ func (s *SQLiteStore) AppendToolInvocation(ctx context.Context, invocation domai
 		invocation.CompletedAt.Format(time.RFC3339Nano), invocation.DurationMillis,
 	)
 	return err
+}
+
+func (s *SQLiteStore) LatestDocArtifactPath(ctx context.Context, taskID string) (string, error) {
+	var path string
+	err := s.db.QueryRowContext(ctx, `
+		SELECT artifact_path
+		FROM tool_invocations
+		WHERE task_id = ?
+			AND artifact_path <> ''
+			AND tool_name IN ('doc.create', 'doc.append', 'doc.generate', 'doc.update')
+		ORDER BY completed_at DESC
+		LIMIT 1
+	`, taskID).Scan(&path)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return path, err
 }
 
 func (s *SQLiteStore) ListMessages(ctx context.Context, sessionID string, limit int) ([]domain.ConversationMessage, error) {
