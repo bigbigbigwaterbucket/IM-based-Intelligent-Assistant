@@ -1,6 +1,8 @@
 package tools
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"os"
 	"strconv"
@@ -98,7 +100,7 @@ func TestNormalizeMessagesSkipsBotAuthoredMessages(t *testing.T) {
 	t.Parallel()
 
 	runner := NewRunner(Config{FeishuAppID: "cli_bot"})
-	messages := runner.normalizeMessages(&larkim.ListMessageRespData{
+	messages := runner.normalizeMessages(context.Background(), &larkim.ListMessageRespData{
 		Items: []*larkim.Message{
 			{
 				MsgType:    stringPtr("text"),
@@ -120,6 +122,49 @@ func TestNormalizeMessagesSkipsBotAuthoredMessages(t *testing.T) {
 	}
 	if strings.Contains(messages[0], "Assistant任务已启动") || !strings.Contains(messages[0], "用户消息") {
 		t.Fatalf("unexpected normalized messages: %#v", messages)
+	}
+}
+
+func TestMessageContentTextExtractsFileMetadata(t *testing.T) {
+	t.Parallel()
+
+	text := messageContentText("file", `{"file_key":"file_123","file_name":"notes.md"}`)
+	if text != "[文件: notes.md]" {
+		t.Fatalf("expected file metadata fallback, got %q", text)
+	}
+}
+
+func TestMessageFilePreviewWithoutClientLabelsPreviewableFile(t *testing.T) {
+	t.Parallel()
+
+	runner := NewRunner(Config{})
+	preview := runner.messageFilePreview(context.Background(), "om_1", `{"file_key":"file_123","file_name":"notes.md"}`)
+	if !strings.Contains(preview, "[文件: notes.md]") {
+		t.Fatalf("expected file label, got %q", preview)
+	}
+	if !strings.Contains(preview, "未下载解析") {
+		t.Fatalf("expected missing client reason, got %q", preview)
+	}
+}
+
+func TestExtractMessageFileTextReadsDocx(t *testing.T) {
+	t.Parallel()
+
+	data := makeDocxFixture(t, "Hello", "World")
+	text, err := extractMessageFileText("notes.docx", data)
+	if err != nil {
+		t.Fatalf("extract docx: %v", err)
+	}
+	if !strings.Contains(text, "Hello") || !strings.Contains(text, "World") {
+		t.Fatalf("expected docx text, got %q", text)
+	}
+}
+
+func TestExtractMessageFileTextRejectsLegacyDoc(t *testing.T) {
+	t.Parallel()
+
+	if _, err := extractMessageFileText("notes.doc", []byte("legacy")); err == nil {
+		t.Fatal("expected legacy .doc to be rejected")
 	}
 }
 
@@ -271,4 +316,31 @@ func assertFileExists(t *testing.T, path string) {
 
 func stringPtr(value string) *string {
 	return &value
+}
+
+func makeDocxFixture(t *testing.T, paragraphs ...string) []byte {
+	t.Helper()
+
+	var buf strings.Builder
+	buf.WriteString(`<?xml version="1.0" encoding="UTF-8"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>`)
+	for _, paragraph := range paragraphs {
+		buf.WriteString(`<w:p><w:r><w:t>`)
+		buf.WriteString(paragraph)
+		buf.WriteString(`</w:t></w:r></w:p>`)
+	}
+	buf.WriteString(`</w:body></w:document>`)
+
+	var out bytes.Buffer
+	zipWriter := zip.NewWriter(&out)
+	file, err := zipWriter.Create("word/document.xml")
+	if err != nil {
+		t.Fatalf("create docx entry: %v", err)
+	}
+	if _, err := file.Write([]byte(buf.String())); err != nil {
+		t.Fatalf("write docx entry: %v", err)
+	}
+	if err := zipWriter.Close(); err != nil {
+		t.Fatalf("close docx fixture: %v", err)
+	}
+	return out.Bytes()
 }

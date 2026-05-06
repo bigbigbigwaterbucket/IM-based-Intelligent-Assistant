@@ -1,10 +1,14 @@
 package tools
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
+	"encoding/xml"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -23,6 +27,7 @@ import (
 
 const defaultArtifactDir = "data/pilot_artifacts"
 const maxFeishuDocxDescendantChildren = 1000
+const maxMessageFilePreviewBytes = 256 * 1024
 
 type Config struct {
 	FeishuAppID       string
@@ -111,7 +116,7 @@ func (r *Runner) FetchThread(ctx context.Context, task domain.Task, step domain.
 		return failed("im.fetch_thread", fmt.Errorf("Feishu IM list failed: code=%d msg=%s", resp.Code, resp.Msg))
 	}
 
-	messages := r.normalizeMessages(resp.Data, task.ThreadID)
+	messages := r.normalizeMessages(ctx, resp.Data, task.ThreadID)
 	if len(messages) > 0 {
 		data["messages"] = strings.Join(messages, "\n")
 	}
@@ -838,9 +843,9 @@ func renderSlideMarkdown(plan domain.Plan) string {
 
 func writePPTXFromMarkdown(markdown, path string) error {
 	opts := genppt.DefaultMarkdownOptions()
-	opts.TitleFontSize = 40
-	opts.HeadingFontSize = 30
-	opts.BodyFontSize = 18
+	opts.TitleFontSize = 35
+	opts.HeadingFontSize = 25
+	opts.BodyFontSize = 15
 	opts.TitleColor = "#1E3A5F"
 	opts.HeadingColor = "#1E3A5F"
 	opts.BodyColor = "#333333"
@@ -860,7 +865,7 @@ func firstMarkdownTitle(markdown string) string {
 	return "任务演示稿"
 }
 
-func (r *Runner) normalizeMessages(data *larkim.ListMessageRespData, threadID string) []string {
+func (r *Runner) normalizeMessages(ctx context.Context, data *larkim.ListMessageRespData, threadID string) []string {
 	if data == nil {
 		return nil
 	}
@@ -896,9 +901,15 @@ func (r *Runner) normalizeMessages(data *larkim.ListMessageRespData, threadID st
 			sender = *item.Sender.Id
 		}
 		msgType := stringValue(item.MsgType)
+		messageID := stringValue(item.MessageId)
 		content := ""
 		if item.Body != nil {
 			content = messageContentText(msgType, stringValue(item.Body.Content))
+		}
+		if msgType == "file" {
+			if preview := r.messageFilePreview(ctx, messageID, stringValue(item.Body.Content)); preview != "" {
+				content = preview
+			}
 		}
 		if strings.TrimSpace(content) == "" {
 			content = "[" + fallbackText(msgType, "message") + "]"
@@ -942,8 +953,157 @@ func messageContentText(msgType, raw string) string {
 				return strings.TrimSpace(text)
 			}
 		}
+	case "file":
+		info := parseMessageFileContent(raw)
+		if info.FileKey != "" {
+			return "[文件: " + fallbackText(info.FileName, info.FileKey) + "]"
+		}
 	}
 	return strings.TrimSpace(collectJSONText(payload))
+}
+
+func (r *Runner) messageFilePreview(ctx context.Context, messageID, rawContent string) string {
+	info := parseMessageFileContent(rawContent)
+	if info.FileKey == "" {
+		return ""
+	}
+	label := "[文件: " + fallbackText(info.FileName, info.FileKey) + "]"
+	if !isPreviewableMessageFile(info.FileName) {
+		return label
+	}
+	if r == nil || r.client == nil || strings.TrimSpace(messageID) == "" {
+		return label + " (未下载解析: Feishu SDK client or message_id missing)"
+	}
+	req := larkim.NewGetMessageResourceReqBuilder().
+		MessageId(messageID).
+		FileKey(info.FileKey).
+		Type("file").
+		Build()
+	resp, err := r.client.Im.V1.MessageResource.Get(ctx, req)
+	if err != nil {
+		return label + " (下载失败: " + truncateText(err.Error(), 120) + ")"
+	}
+	if resp == nil {
+		return label + " (下载失败: empty response)"
+	}
+	if !resp.Success() {
+		return label + fmt.Sprintf(" (下载失败: code=%d msg=%s)", resp.Code, truncateText(resp.Msg, 120))
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.File, maxMessageFilePreviewBytes+1))
+	if err != nil {
+		return label + " (读取失败: " + truncateText(err.Error(), 120) + ")"
+	}
+	if len(data) > maxMessageFilePreviewBytes {
+		data = data[:maxMessageFilePreviewBytes]
+	}
+	text, err := extractMessageFileText(info.FileName, data)
+	if err != nil {
+		return label + " (解析失败: " + truncateText(err.Error(), 120) + ")"
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return label + " (文件内容为空)"
+	}
+	return label + "\n" + truncateText(text, 4000)
+}
+
+type messageFileInfo struct {
+	FileKey  string
+	FileName string
+}
+
+func parseMessageFileContent(raw string) messageFileInfo {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &payload); err != nil {
+		return messageFileInfo{}
+	}
+	return messageFileInfo{
+		FileKey:  firstString(payload, "file_key", "fileKey"),
+		FileName: firstString(payload, "file_name", "fileName", "name"),
+	}
+}
+
+func firstString(payload map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func isPreviewableMessageFile(name string) bool {
+	switch strings.ToLower(filepath.Ext(strings.TrimSpace(name))) {
+	case ".md", ".markdown", ".txt", ".text", ".docx":
+		return true
+	default:
+		return false
+	}
+}
+
+func extractMessageFileText(name string, data []byte) (string, error) {
+	switch strings.ToLower(filepath.Ext(strings.TrimSpace(name))) {
+	case ".md", ".markdown", ".txt", ".text":
+		return string(data), nil
+	case ".docx":
+		return extractDocxText(data)
+	case ".doc":
+		return "", errors.New("legacy .doc is not supported")
+	default:
+		return "", errors.New("unsupported file type")
+	}
+}
+
+func extractDocxText(data []byte) (string, error) {
+	reader, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		return "", err
+	}
+	for _, file := range reader.File {
+		if file.Name != "word/document.xml" {
+			continue
+		}
+		rc, err := file.Open()
+		if err != nil {
+			return "", err
+		}
+		defer rc.Close()
+		return textFromWordDocumentXML(rc)
+	}
+	return "", errors.New("word/document.xml not found")
+}
+
+func textFromWordDocumentXML(reader io.Reader) (string, error) {
+	decoder := xml.NewDecoder(reader)
+	var b strings.Builder
+	needSpace := false
+	for {
+		token, err := decoder.Token()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return "", err
+		}
+		switch typed := token.(type) {
+		case xml.StartElement:
+			if typed.Name.Local == "p" && b.Len() > 0 {
+				b.WriteString("\n")
+				needSpace = false
+			}
+		case xml.CharData:
+			text := strings.TrimSpace(string(typed))
+			if text == "" {
+				continue
+			}
+			if needSpace {
+				b.WriteString(" ")
+			}
+			b.WriteString(text)
+			needSpace = true
+		}
+	}
+	return strings.TrimSpace(b.String()), nil
 }
 
 func collectJSONText(value any) string {

@@ -148,25 +148,7 @@ func validRevisionPlan(plan domain.Plan, task domain.Task) bool {
 	if plan.Summary == "" || plan.Analysis.Objective == "" || len(plan.Steps) == 0 {
 		return false
 	}
-	hasExecutableStep := false
-	for _, step := range plan.Steps {
-		switch step.Tool {
-		case "intent.analyze", "planner.build", "im.fetch_thread":
-		case "doc.update":
-			if task.DocURL == "" && task.DocID == "" {
-				return false
-			}
-			hasExecutableStep = true
-		case "slide.regenerate":
-			if task.SlidesURL == "" {
-				return false
-			}
-			hasExecutableStep = true
-		case "sync.broadcast":
-			hasExecutableStep = true
-		}
-	}
-	return hasExecutableStep
+	return true
 }
 
 func BuildHeuristicRevisionPlan(task domain.Task, instruction string) domain.Plan {
