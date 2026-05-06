@@ -4,6 +4,7 @@ import type {
   CollabSnapshotRequest,
   CollabState,
   CollabUpdate,
+  CollabUpdateRequest,
   ConnectionStatus,
   EventEnvelope,
   Task,
@@ -77,6 +78,18 @@ export async function loadCollabUpdates(docKey: string, sinceSeq: number): Promi
   }
   const payload = (await response.json()) as unknown;
   return Array.isArray(payload) ? (payload as CollabUpdate[]) : [];
+}
+
+export async function appendCollabUpdate(docKey: string, payload: CollabUpdateRequest): Promise<CollabUpdate> {
+  const response = await fetch(`${requireAPIBase()}/collab/docs/${encodeURIComponent(docKey)}/updates`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    throw new Error("Failed to append collaborative update");
+  }
+  return (await response.json()) as CollabUpdate;
 }
 
 export async function saveCollabSnapshot(docKey: string, payload: CollabSnapshotRequest): Promise<CollabDocument> {

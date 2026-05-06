@@ -194,3 +194,62 @@ func TestOlderSnapshotIsRejected(t *testing.T) {
 		t.Fatal("expected older snapshot to be rejected")
 	}
 }
+
+func TestAppendUpdateDeduplicatesSameClientAndBlob(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", "file::memory:?cache=shared")
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	defer db.Close()
+	taskStore, err := store.NewSQLiteStore(db)
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
+	service, err := NewService(db, taskStore)
+	if err != nil {
+		t.Fatalf("service: %v", err)
+	}
+
+	now := time.Now()
+	_, err = taskStore.Create(ctx, domain.Task{
+		TaskID:          "task-dedupe",
+		Title:           "Doc",
+		UserInstruction: "write",
+		Source:          "test",
+		Status:          domain.StatusCompleted,
+		CurrentStep:     "completed",
+		ProgressText:    "done",
+		Version:         1,
+		LastActor:       "test",
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	})
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	doc, err := service.EnsureMarkdownDocument(ctx, "task-dedupe")
+	if err != nil {
+		t.Fatalf("ensure doc: %v", err)
+	}
+
+	payload := base64.StdEncoding.EncodeToString([]byte("same-update"))
+	first, err := service.appendUpdate(ctx, doc.DocKey, "client-a", payload)
+	if err != nil {
+		t.Fatalf("append first: %v", err)
+	}
+	second, err := service.appendUpdate(ctx, doc.DocKey, "client-a", payload)
+	if err != nil {
+		t.Fatalf("append second: %v", err)
+	}
+	if first.Seq != second.Seq {
+		t.Fatalf("expected duplicate update to keep seq %d, got %d", first.Seq, second.Seq)
+	}
+	updates, err := service.UpdatesSince(ctx, doc.DocKey, 0)
+	if err != nil {
+		t.Fatalf("updates since: %v", err)
+	}
+	if len(updates) != 1 {
+		t.Fatalf("expected one stored update, got %d", len(updates))
+	}
+}

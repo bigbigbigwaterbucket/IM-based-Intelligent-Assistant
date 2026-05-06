@@ -103,6 +103,11 @@ export interface CollabSnapshotRequest {
   clientId: string;
 }
 
+export interface CollabUpdateRequest {
+  clientId: string;
+  updateBase64: string;
+}
+
 export interface CollabExportRequest {
   markdown: string;
   baseSeq: number;

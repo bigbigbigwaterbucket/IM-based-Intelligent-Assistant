@@ -312,7 +312,7 @@ func (h *Handler) notifyWhenDone(messageID, taskID string) {
 func (h *Handler) startedText(task domain.Task) string {
 	lines := []string{
 		fmt.Sprintf("Assistant任务已启动：%s", task.TaskID),
-		"实时查看任务进度:http://localhost:",
+		"实时查看任务进度/在线编辑文档: http://localhost:5173",
 		"我会在完成后回复汇总结果。",
 	}
 	if link := h.taskLink(task.TaskID); link != "" {

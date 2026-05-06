@@ -66,6 +66,11 @@ type ExportRequest struct {
 	ClientID             string `json:"clientId"`
 }
 
+type UpdateRequest struct {
+	ClientID     string `json:"clientId"`
+	UpdateBase64 string `json:"updateBase64"`
+}
+
 type Service struct {
 	db          *sql.DB
 	tasks       TaskRepository
@@ -301,6 +306,25 @@ func (s *Service) handleCollabDoc(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusOK, updates)
+	case action == "updates" && r.Method == http.MethodPost:
+		var req UpdateRequest
+		if err := readJSON(r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid payload"})
+			return
+		}
+		update, err := s.appendUpdate(r.Context(), docKey, req.ClientID, req.UpdateBase64)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.broadcast(docKey, wsMessage{
+			Type:         "update",
+			DocKey:       docKey,
+			Seq:          update.Seq,
+			ClientID:     update.ClientID,
+			UpdateBase64: update.UpdateBase64,
+		})
+		writeJSON(w, http.StatusCreated, update)
 	case action == "snapshot" && r.Method == http.MethodPost:
 		var req SnapshotRequest
 		if err := readJSON(r, &req); err != nil {
@@ -442,6 +466,27 @@ func (s *Service) appendUpdate(ctx context.Context, docKey, clientID, rawUpdate 
 		return Update{}, err
 	}
 	defer tx.Rollback()
+
+	var existingSeq int64
+	var existingCreatedAt string
+	if err := tx.QueryRowContext(ctx, `
+		SELECT seq, created_at
+		FROM collab_updates
+		WHERE doc_key = ? AND client_id = ? AND update_blob = ?
+		ORDER BY seq ASC
+		LIMIT 1
+	`, docKey, clientID, update).Scan(&existingSeq, &existingCreatedAt); err == nil {
+		createdAt, _ := time.Parse(time.RFC3339Nano, existingCreatedAt)
+		return Update{
+			DocKey:       docKey,
+			Seq:          existingSeq,
+			ClientID:     clientID,
+			UpdateBase64: rawUpdate,
+			CreatedAt:    createdAt,
+		}, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return Update{}, err
+	}
 
 	var updateMax int64
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq), 0) FROM collab_updates WHERE doc_key = ?`, docKey).Scan(&updateMax); err != nil {
